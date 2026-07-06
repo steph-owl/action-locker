@@ -1,6 +1,6 @@
 # action-locker
 
-A **lockfile** for your GitHub Actions — and a **locker** for the ones you
+A **lockfile** for your GitHub Actions and a **locker** for the ones you
 can't afford to lose. Pin, verify, and vendor, so your CI survives both
 supply chain attacks and upstream disappearance.
 
@@ -27,8 +27,8 @@ When you write `uses: some-org/cool-action@v1` in a workflow, you're trusting th
 and **vendor** a local snapshot of the actions you can't afford to lose.
 
 The whole tool is a single stdlib-only Python file. A supply-chain tool
-should not arrive with its own supply chain — you can read every line of
-`action_locker.py` before trusting it, and we encourage you to.
+should not arrive with its own supply chain. You can read every line of
+`action_locker.py` before trusting it. Or ask a model to if that's your vibe.
 
 ## How it works
 
@@ -135,54 +135,24 @@ Does **not** protect against:
 - **`docker://` images** — different supply chain; pin those by digest
   (`@sha256:…`) and action-locker will stay out of your way.
 
-## Who pins the pinner?
+## Fun fact
 
-Turtles all the way down, addressed explicitly:
-
-- The composite action: consume it at a SHA like everything else —
-  `uses: Old-Well-Labs/action-locker@<sha>`. It's one file; audit it first.
-- The reusable workflow checks out the tool at `job.workflow_sha` — the
-  exact commit *you* pinned when you wrote
-  `uses: Old-Well-Labs/action-locker/.github/workflows/verify-action-locker.yml@<sha>`.
-  There is no mutable `@v1` hop hiding in the middle.
 - This repo's own CI runs `action_locker.py verify` on itself; its workflows
   are SHA-pinned and locked in its own `action-lock.json`.
 
 ## Prior art (and why this exists anyway)
 
-This space got real attention after the tj-actions attack, and you should
-know your options:
+We all know by now how insecure GHA is by default. But you gotta make your devs happy - and this was my design solution to that. Now I can set "Require actions to be pinned to a full-length commit SHA" to `true` and my devs just see another pre-commit hook.
 
-- [pinact](https://github.com/suzuki-shunsuke/pinact),
-  [ratchet](https://github.com/sethvargo/ratchet),
-  [frizbee](https://github.com/stacklok/frizbee) — rewrite refs to SHAs.
-  Pinners, not lockfiles: no record of provenance, no verification of
-  content, no disappearance story.
-- [gh-actions-lockfile](https://github.com/gjtorikian/gh-actions-lockfile),
-  [ghasum](https://github.com/chains-project/ghasum) — proper lockfiles with
-  integrity hashing (and transitive resolution, which action-locker doesn't do
-  yet). Neither vendors, and neither handles reusable workflows
-  (`uses: org/repo/.github/workflows/x.yml@ref`) — action-locker does both.
-- **Dependabot / Renovate** — keep pinned SHAs fresh via PRs. Complementary:
-  use them alongside action-locker (`rewrite` emits the `# tag` comments they
-  understand).
-- **GitHub native**: immutable releases went GA in late 2025, and the 2026
-  Actions security roadmap includes workflow dependency locking. Both are
-  good news, and neither helps when upstream *disappears* — an immutable
-  release of a deleted repo is still deleted, and a native lockfile still
-  points at a repo you don't control.
+There are other options in this problem space, and Github says they're going to do this natively eventually.
 
-The one-line positioning: **everyone else answers "is this the code I
-chose?" — action-locker also answers "do I still have the code I chose?"**
+But I've been using this pattern for a while now, and have been happy with it. The vendoring was important to me and it seemed differentiated enough to make this worth sharing.
 
 ## Install
 
-It's one file. Choose your ritual:
+It's one file. 
 
 ```bash
-# Copy it into your repo (recommended — then it's pinned too, by your own git history)
-curl -o action_locker.py https://raw.githubusercontent.com/Old-Well-Labs/action-locker/<sha>/action_locker.py
-
 # Or run from a clone
 python3 action_locker.py --help
 ```
@@ -203,11 +173,12 @@ python3 action_locker.py update    # check upstream; --apply to accept
 ## Trusted prefixes
 
 Internal reusable workflows (e.g.
-`your-org/infrastructure/.github/workflows/shared-build.yml@main`) often
-intentionally track `@main` — SHA-pinning them would require a cross-repo
-update on every shared-workflow change, and you already control both sides.
-Add a `trusted_prefixes` list to the lockfile to downgrade those from
-errors to warnings in `verify`:
+`your-org/your-repo/.github/workflows/shared-build.yml@main`) often
+intentionally track `@main` and SHA-pinning them would require a cross-repo
+update on every shared-workflow change. 
+
+If that's an issue, and you do not care about enabling the
+`Require actions to be pinned to a full-length commit SHA` , add a `trusted_prefixes` list to the lockfile to downgrade those from errors to warnings in `verify`:
 
 ```json
 {
@@ -290,21 +261,19 @@ python3 -m pytest -m network # live integration tests (git ls-remote against Git
 
 ## Roadmap
 
-- **A GitHub App** with permissions scoped to exactly one file — the
-  lockfile — able to open re-lock/re-verify PRs across consumer repos
-  without a broad PAT (replacing the `ACTION_LOCK_DISPATCH_TOKEN` pattern).
+- **A GitHub App** with permissions scoped to exactly one file,
+  `action-lock.json`. It will be able to open re-lock/re-verify PRs across consumer repos without a broad PAT (replacing the `ACTION_LOCK_DISPATCH_TOKEN` pattern).
 - **Transitive resolution**: surface and pin the `uses:` references inside
-  vendored composite actions.
-- **SBOM output** for your Actions dependency tree.
+  vendored composite actions. 
 
 See the [demo repo](https://github.com/Old-Well-Labs/action-locker-demo) for
-a worked example: a small app with pinned workflows, a lockfile, vendored
+a working example: a small app with pinned workflows, a lockfile, vendored
 actions, and the CI wiring.
 
-## About OWL
-s
-Built at [Old Well Labs](https://oldwell-labs.com) by Steph Prime (hn: sudosteph)
+## About 
 
-We're a fintech startup, we're growing fast, and **we are actively hiring Software Engineers** and **Data Engieneers** to join us in our **Charlotte NC** office (hybrid WFH). So if massive data sets don't scare you, if you've got a "bias for action" bent, and if you are cool with Charlotte but looking for something more exciting than a big bank - [apply now](https://jobs.ashbyhq.com/old-well-labs). 
+`action-locker` was build by Steph Prime at [Old Well Labs](https://oldwell-labs.com)
+
+We're a fintech startup, we're growing fast, and **we are actively hiring Software Engineers** and **Data Engineers** to join us in our **Charlotte NC** office (hybrid WFH). So if massive data sets don't scare you, if you've got a "bias for action" bent, and if you are cool with Charlotte but looking for something more exciting than a big bank - [apply now](https://jobs.ashbyhq.com/old-well-labs). 
 
 Licensed under [Apache-2.0](LICENSE).
