@@ -11,11 +11,17 @@
 #     repository_dispatch:
 #       types: [action-lock-reverify]
 #
+# The feature itself is opt-in via subscribers.txt:
+#   - no active entries        -> this job is a green no-op (forks stay green)
+#   - entries but no token     -> LOUD failure: you asked for fan-out and it
+#                                 can't happen; silent non-dispatch is exactly
+#                                 the false-confidence failure we refuse to have
+#   - entries + token          -> dispatch, per-repo failures collected
+#
 # Cross-repo dispatch cannot use the default GITHUB_TOKEN (it is scoped to
-# this repo only). It requires a token with `contents: write` (fine-grained
-# "Contents" read/write grants the dispatches endpoint) on the subscriber
-# repos, stored as the ACTION_LOCK_DISPATCH_TOKEN secret. The job fails
-# loudly if the secret is missing rather than silently dispatching nothing.
+# this repo only). It requires a token with fine-grained "Contents"
+# read/write on the subscriber repos (that grants the dispatches endpoint),
+# stored as the ACTION_LOCK_DISPATCH_TOKEN secret.
 
 name: dispatch-reverify
 
@@ -48,15 +54,21 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [ -z "${GH_TOKEN}" ]; then
-            echo "::error::ACTION_LOCK_DISPATCH_TOKEN secret is not set — cannot dispatch cross-repo. See header comment in this workflow."
-            exit 1
-          fi
-
           if [ -n "${TARGET_REPO}" ]; then
             repos="${TARGET_REPO}"
           else
-            repos=$(grep -Ev '^\s*(#|$)' subscribers.txt)
+            # grep exits 1 on zero matches; an empty list is a valid state
+            repos=$(grep -Ev '^\s*(#|$)' subscribers.txt || true)
+          fi
+
+          if [ -z "${repos}" ]; then
+            echo "::notice::subscribers.txt has no active entries — nothing to dispatch. Fan-out is opt-in: list consumer repos there to enable it."
+            exit 0
+          fi
+
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "::error::subscribers.txt lists repos to re-verify, but the ACTION_LOCK_DISPATCH_TOKEN secret is not set — cross-repo dispatch is impossible (the default GITHUB_TOKEN is repo-scoped). Fix: add a fine-grained PAT with Contents read/write on the subscriber repos as ACTION_LOCK_DISPATCH_TOKEN, or comment out the subscribers.txt entries until you're ready. Failing loudly because 'consumers silently stopped being re-verified' is worse than a red build."
+            exit 1
           fi
 
           failed=0

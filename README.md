@@ -336,9 +336,13 @@ in `subscribers.txt`, so consumers re-check their lockfiles without waiting
 for their next PR. It can also be run manually via `workflow_dispatch`
 (optionally targeting one repo).
 
-Requires the `ACTION_LOCK_DISPATCH_TOKEN` repo secret — a token with access
-to the subscriber repos; the default `GITHUB_TOKEN` cannot dispatch
-cross-repo. The job fails loudly if the secret is missing.
+The feature is opt-in via `subscribers.txt`: with no active entries the
+job is a green no-op (fresh forks stay green). Once you list subscribers,
+the `ACTION_LOCK_DISPATCH_TOKEN` secret becomes required — a fine-grained
+PAT with Contents read/write on the subscriber repos; the default
+`GITHUB_TOKEN` cannot dispatch cross-repo. Subscribers-without-token fails
+loudly on purpose: "consumers silently stopped being re-verified" is the
+false-confidence failure this workflow exists to prevent.
 
 ## Tests
 
