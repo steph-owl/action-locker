@@ -5,4 +5,4 @@
 #
 # Add your consumer repos here, e.g.:
 #   your-org/your-app
-Old-Well-Labs/action-locker-demo
+steph-owl/action-locker-demo

@@ -64,7 +64,7 @@ jobs:
             echo "Dispatching action-lock-reverify -> ${repo}"
             if ! gh api "repos/${repo}/dispatches" \
                 -f event_type=action-lock-reverify \
-                -f "client_payload[source]=Old-Well-Labs/action-locker" \
+                -f "client_payload[source]=steph-owl/action-locker" \
                 -f "client_payload[source_sha]=${GITHUB_SHA}"; then
               echo "::error::Dispatch to ${repo} failed"
               failed=1

@@ -91,6 +91,6 @@ Sleep 4.5s
 
 Type "clear"
 Enter
-Type "# pin everything. vendor critical.   github.com/Old-Well-Labs/action-locker"
+Type "# pin everything. vendor critical.   github.com/steph-owl/action-locker"
 Enter
 Sleep 5s

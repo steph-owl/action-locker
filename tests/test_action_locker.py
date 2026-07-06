@@ -531,6 +531,34 @@ class TestVendorRecordsIntegrity:
         assert run_verify(tmp_path) == 0
 
 
+def patch_commit_age(monkeypatch, age_days, release_age_days=None, pr_age_days=None):
+    """Make the age floor see the given ages, offline.
+
+    age_days: committer-date age (None = undeterminable).
+    release_age_days: immutable-release age (None = no immutable release).
+    pr_age_days: earliest merged-PR age (None = no merged PR).
+    The None defaults keep every test off the network."""
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+
+    def dated(days):
+        return None if days is None else now - timedelta(days=days)
+
+    monkeypatch.setattr(
+        action_locker, "get_commit_date",
+        lambda repo, sha, token=None: dated(age_days),
+    )
+    monkeypatch.setattr(
+        action_locker, "get_release_published_at",
+        lambda repo, tag, token=None: dated(release_age_days),
+    )
+    monkeypatch.setattr(
+        action_locker, "get_earliest_merged_pr_date",
+        lambda repo, sha, token=None: dated(pr_age_days),
+    )
+
+
 class TestLockForcePreservesIntegrity:
     def test_same_sha_relock_keeps_integrity(self, tmp_path, monkeypatch, capsys):
         """`lock --force` on an unchanged ref must not drop the vendored
@@ -545,6 +573,7 @@ class TestLockForcePreservesIntegrity:
         e["integrity"] = "sha256:" + "d" * 64
         write_lockfile(tmp_path, {"x/y@v1": e})
         monkeypatch.setenv("GITHUB_TOKEN", "test-token")
+        patch_commit_age(monkeypatch, 30)  # age floor applies to bare Namespaces too
 
         # Same SHA -> integrity survives
         monkeypatch.setattr(action_locker, "resolve_ref_to_sha", lambda *a, **kw: sha)
@@ -568,9 +597,525 @@ class TestUpdateClearsIntegrity:
         write_lockfile(tmp_path, {"x/y@v1": e})
 
         monkeypatch.setattr(action_locker, "resolve_ref_to_sha", lambda *a, **kw: new_sha)
+        patch_commit_age(monkeypatch, 30)  # aged commit: floor passes, apply proceeds
         cmd_update(argparse.Namespace(apply=True), tmp_path)
 
         lockdata = load_lockfile(tmp_path)
         assert lockdata["locked"]["x/y@v1"]["resolved"] == new_sha
         assert lockdata["locked"]["x/y@v1"]["integrity"] is None
         assert "integrity hashes were cleared" in capsys.readouterr().out
+
+    def test_apply_skip_fresh_keeps_integrity(self, tmp_path, monkeypatch, capsys):
+        """A SKIPPED (too-fresh) update must keep both the old pin AND its
+        integrity hash — the vendored copy is still the locked content."""
+        old_sha, new_sha = "1" * 40, "2" * 40
+        wf = tmp_path / ".github" / "workflows"
+        wf.mkdir(parents=True)
+        wf.joinpath("ci.yml").write_text(f"jobs:\n  a:\n    steps:\n      - uses: x/y@{old_sha}\n")
+        e = entry("x/y", old_sha, "v1")
+        e["integrity"] = "sha256:" + "e" * 64
+        write_lockfile(tmp_path, {"x/y@v1": e})
+
+        monkeypatch.setattr(action_locker, "resolve_ref_to_sha", lambda *a, **kw: new_sha)
+        patch_commit_age(monkeypatch, 1)  # fresh: below the floor
+        cmd_update(argparse.Namespace(apply=True), tmp_path)
+
+        out = capsys.readouterr().out
+        assert "SKIPPED x/y" in out and "No updates applied" in out
+        lockdata = load_lockfile(tmp_path)
+        assert lockdata["locked"]["x/y@v1"]["resolved"] == old_sha
+        assert lockdata["locked"]["x/y@v1"]["integrity"] == "sha256:" + "e" * 64
+
+
+# --- commit age floor (lock) ---
+
+def lock_args(**overrides):
+    defaults = dict(force=False, allow_fresh=False, min_age_days=5.0)
+    defaults.update(overrides)
+    return argparse.Namespace(**defaults)
+
+
+@pytest.fixture
+def aged_repo(tmp_path):
+    """Single third-party action on a mutable tag, plus one trusted ref."""
+    wf = tmp_path / ".github" / "workflows"
+    wf.mkdir(parents=True)
+    wf.joinpath("ci.yml").write_text(
+        "jobs:\n"
+        "  shared:\n"
+        "    uses: Old-Well-Labs/infrastructure/.github/workflows/shared-build.yml@main\n"
+        "  a:\n"
+        "    steps:\n"
+        "      - uses: x/y@v1\n"
+    )
+    return tmp_path
+
+
+class TestCommitAgeFloor:
+    SHA = "6" * 40
+
+    def _patch(self, monkeypatch, age_days):
+        monkeypatch.setattr(action_locker, "get_github_token", lambda: None)
+        monkeypatch.setattr(
+            action_locker, "resolve_ref_to_sha", lambda repo, ref, token=None: self.SHA
+        )
+        patch_commit_age(monkeypatch, age_days)
+
+    def test_refuses_fresh_third_party_commit(self, aged_repo, monkeypatch, capsys):
+        self._patch(monkeypatch, age_days=1)
+        write_lockfile(aged_repo, {}, trusted_prefixes=["Old-Well-Labs/"])
+        with pytest.raises(SystemExit):
+            action_locker.cmd_lock(lock_args(), aged_repo)
+        out = capsys.readouterr().out
+        assert "REFUSED" in out
+        assert "age floor" in out
+        lockdata = load_lockfile(aged_repo)
+        assert "x/y@v1" not in lockdata["locked"]
+
+    def test_locks_aged_third_party_commit(self, aged_repo, monkeypatch):
+        self._patch(monkeypatch, age_days=30)
+        write_lockfile(aged_repo, {}, trusted_prefixes=["Old-Well-Labs/"])
+        action_locker.cmd_lock(lock_args(), aged_repo)
+        lockdata = load_lockfile(aged_repo)
+        assert lockdata["locked"]["x/y@v1"]["resolved"] == self.SHA
+
+    def test_trusted_prefix_exempt_from_age_check(self, aged_repo, monkeypatch):
+        self._patch(monkeypatch, age_days=30)
+
+        def boom(repo, sha, token=None):
+            raise AssertionError(f"age check ran for trusted repo {repo}")
+
+        write_lockfile(aged_repo, {}, trusted_prefixes=["Old-Well-Labs/"])
+        # Only the trusted ref remains; age lookup must never fire for it
+        wf = aged_repo / ".github" / "workflows" / "ci.yml"
+        wf.write_text(
+            "jobs:\n"
+            "  shared:\n"
+            "    uses: Old-Well-Labs/infrastructure/.github/workflows/shared-build.yml@main\n"
+        )
+        monkeypatch.setattr(action_locker, "get_commit_date", boom)
+        action_locker.cmd_lock(lock_args(), aged_repo)
+
+    def test_allow_fresh_overrides_floor(self, aged_repo, monkeypatch):
+        self._patch(monkeypatch, age_days=0.1)
+        write_lockfile(aged_repo, {}, trusted_prefixes=["Old-Well-Labs/"])
+        action_locker.cmd_lock(lock_args(allow_fresh=True), aged_repo)
+        lockdata = load_lockfile(aged_repo)
+        assert lockdata["locked"]["x/y@v1"]["resolved"] == self.SHA
+
+    def test_unknown_age_fails_closed(self, aged_repo, monkeypatch, capsys):
+        self._patch(monkeypatch, age_days=None)
+        write_lockfile(aged_repo, {}, trusted_prefixes=["Old-Well-Labs/"])
+        with pytest.raises(SystemExit):
+            action_locker.cmd_lock(lock_args(), aged_repo)
+        assert "could not determine commit age" in capsys.readouterr().out
+        lockdata = load_lockfile(aged_repo)
+        assert "x/y@v1" not in lockdata["locked"]
+
+    def test_min_age_days_tunable(self, aged_repo, monkeypatch):
+        self._patch(monkeypatch, age_days=3)
+        write_lockfile(aged_repo, {}, trusted_prefixes=["Old-Well-Labs/"])
+        action_locker.cmd_lock(lock_args(min_age_days=2.0), aged_repo)
+        lockdata = load_lockfile(aged_repo)
+        assert lockdata["locked"]["x/y@v1"]["resolved"] == self.SHA
+
+    def test_bare_namespace_defaults_age_floor(self, aged_repo, monkeypatch):
+        """Programmatic callers passing only `force` must not AttributeError;
+        the age floor still applies with default settings."""
+        self._patch(monkeypatch, age_days=1)
+        write_lockfile(aged_repo, {}, trusted_prefixes=["Old-Well-Labs/"])
+        with pytest.raises(SystemExit):  # refused by default 5-day floor
+            action_locker.cmd_lock(argparse.Namespace(force=False), aged_repo)
+        lockdata = load_lockfile(aged_repo)
+        assert "x/y@v1" not in lockdata["locked"]
+
+
+# --- age trust ladder: immutable releases beat committer dates ---
+
+class TestAgeTrustLadder:
+    SHA = "6" * 40
+
+    def _repo(self, tmp_path):
+        wf = tmp_path / ".github" / "workflows"
+        wf.mkdir(parents=True)
+        wf.joinpath("ci.yml").write_text(
+            "jobs:\n  a:\n    steps:\n      - uses: x/y@v1\n"
+        )
+        write_lockfile(tmp_path, {})
+        return tmp_path
+
+    def _patch_resolve(self, monkeypatch):
+        monkeypatch.setattr(action_locker, "get_github_token", lambda: None)
+        monkeypatch.setattr(
+            action_locker, "resolve_ref_to_sha", lambda repo, ref, token=None: self.SHA
+        )
+
+    def test_backdated_commit_fresh_immutable_release_refused(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """THE attack the ladder defeats: attacker backdates the malicious
+        commit 100 days, but the immutable release binding the tag was
+        published yesterday — the server-side date wins, floor refuses."""
+        repo = self._repo(tmp_path)
+        self._patch_resolve(monkeypatch)
+        patch_commit_age(monkeypatch, age_days=100, release_age_days=0.5)
+        with pytest.raises(SystemExit):
+            action_locker.cmd_lock(lock_args(), repo)
+        out = capsys.readouterr().out
+        assert "REFUSED" in out
+        assert "immutable release" in out
+
+    def test_old_immutable_release_passes_regardless_of_commit_date(
+        self, tmp_path, monkeypatch
+    ):
+        """An immutable release from 30 days ago froze the tag→commit binding
+        30 days ago — that's the age that matters."""
+        repo = self._repo(tmp_path)
+        self._patch_resolve(monkeypatch)
+        patch_commit_age(monkeypatch, age_days=1, release_age_days=30)
+        action_locker.cmd_lock(lock_args(), repo)
+        assert load_lockfile(repo)["locked"]["x/y@v1"]["resolved"] == self.SHA
+
+    def test_no_immutable_release_falls_back_to_committer_date(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        repo = self._repo(tmp_path)
+        self._patch_resolve(monkeypatch)
+        patch_commit_age(monkeypatch, age_days=1, release_age_days=None)
+        with pytest.raises(SystemExit):
+            action_locker.cmd_lock(lock_args(), repo)
+        out = capsys.readouterr().out
+        assert "REFUSED" in out
+        assert "committer date" in out
+
+    def test_sha_ref_passes_no_tag_to_release_lookup(self, tmp_path, monkeypatch):
+        """A bare SHA ref has no tag — the release lookup must receive
+        tag=None (its falsy-tag early return keeps it off the network)."""
+        sha = "8" * 40
+        wf = tmp_path / ".github" / "workflows"
+        wf.mkdir(parents=True)
+        wf.joinpath("ci.yml").write_text(
+            f"jobs:\n  a:\n    steps:\n      - uses: x/y@{sha}\n"
+        )
+        write_lockfile(tmp_path, {})
+        monkeypatch.setattr(action_locker, "get_github_token", lambda: None)
+
+        seen_tags = []
+
+        def spy(repo, tag, token=None):
+            seen_tags.append(tag)
+            return None
+
+        monkeypatch.setattr(action_locker, "get_release_published_at", spy)
+        from datetime import datetime, timedelta, timezone
+        monkeypatch.setattr(
+            action_locker, "get_commit_date",
+            lambda repo, s, token=None: datetime.now(timezone.utc) - timedelta(days=30),
+        )
+        action_locker.cmd_lock(lock_args(), tmp_path)
+        assert seen_tags == [None]
+        assert load_lockfile(tmp_path)["locked"][f"x/y@{sha}"]["resolved"] == sha
+
+    def test_update_apply_uses_release_date(self, tmp_path, monkeypatch, capsys):
+        old_sha, new_sha = "1" * 40, "2" * 40
+        write_lockfile(tmp_path, {"x/y@v1": entry("x/y", old_sha, "v1")})
+        monkeypatch.setattr(action_locker, "get_github_token", lambda: None)
+        monkeypatch.setattr(
+            action_locker, "resolve_ref_to_sha", lambda repo, ref, token=None: new_sha
+        )
+        patch_commit_age(monkeypatch, age_days=100, release_age_days=1)
+        action_locker.cmd_update(update_args(), tmp_path)
+        out = capsys.readouterr().out
+        assert "SKIPPED x/y" in out and "immutable release" in out
+        assert load_lockfile(tmp_path)["locked"]["x/y@v1"]["resolved"] == old_sha
+
+
+# --- lockfile policy: per-prefix floors + trusted-source requirement ---
+
+class TestPolicy:
+    SHA = "6" * 40
+
+    def _repo(self, tmp_path, policy=None, uses="x/y@v1"):
+        wf = tmp_path / ".github" / "workflows"
+        wf.mkdir(parents=True)
+        wf.joinpath("ci.yml").write_text(
+            f"jobs:\n  a:\n    steps:\n      - uses: {uses}\n"
+        )
+        data = {"version": 1, "locked": {}}
+        if policy is not None:
+            data["policy"] = policy
+        (tmp_path / "action-lock.json").write_text(json.dumps(data, indent=2))
+        return tmp_path
+
+    def _patch(self, monkeypatch, **ages):
+        monkeypatch.setattr(action_locker, "get_github_token", lambda: None)
+        monkeypatch.setattr(
+            action_locker, "resolve_ref_to_sha", lambda repo, ref, token=None: self.SHA
+        )
+        patch_commit_age(monkeypatch, **ages)
+
+    def test_prefix_override_zero_floor_admits_fresh_repo(self, tmp_path, monkeypatch):
+        """Steph's case: org's own hot repo adopted immediately — just that
+        repo; everything else keeps the default floor."""
+        repo = self._repo(
+            tmp_path,
+            policy={"overrides": [{"prefix": "steph-owl/action-locker", "min_age_days": 0}]},
+            uses="steph-owl/action-locker/.github/workflows/x.yml@v1",
+        )
+        self._patch(monkeypatch, age_days=0.01)
+        action_locker.cmd_lock(lock_args(min_age_days=None), repo)
+        locked = load_lockfile(repo)["locked"]
+        assert locked["steph-owl/action-locker/.github/workflows/x.yml@v1"]["resolved"] == self.SHA
+
+    def test_non_overridden_action_keeps_default_floor(self, tmp_path, monkeypatch, capsys):
+        repo = self._repo(
+            tmp_path,
+            policy={"overrides": [{"prefix": "steph-owl/action-locker", "min_age_days": 0}]},
+        )
+        self._patch(monkeypatch, age_days=0.01)
+        with pytest.raises(SystemExit):
+            action_locker.cmd_lock(lock_args(min_age_days=None), repo)
+        assert "REFUSED" in capsys.readouterr().out
+
+    def test_policy_min_age_days_replaces_constant_default(self, tmp_path, monkeypatch):
+        repo = self._repo(tmp_path, policy={"min_age_days": 0.5})
+        self._patch(monkeypatch, age_days=1)  # under 5, over 0.5
+        action_locker.cmd_lock(lock_args(min_age_days=None), repo)
+        assert load_lockfile(repo)["locked"]["x/y@v1"]["resolved"] == self.SHA
+
+    def test_explicit_cli_beats_policy(self, tmp_path, monkeypatch, capsys):
+        repo = self._repo(tmp_path, policy={"min_age_days": 0.5})
+        self._patch(monkeypatch, age_days=1)
+        with pytest.raises(SystemExit):
+            action_locker.cmd_lock(lock_args(min_age_days=10.0), repo)
+        assert "REFUSED" in capsys.readouterr().out
+
+    def test_longest_prefix_wins_regardless_of_order(self, tmp_path, monkeypatch):
+        repo = self._repo(
+            tmp_path,
+            policy={"overrides": [
+                {"prefix": "steph-owl/", "min_age_days": 10},
+                {"prefix": "steph-owl/action-locker", "min_age_days": 0},
+            ]},
+            uses="steph-owl/action-locker@v1",
+        )
+        self._patch(monkeypatch, age_days=0.01)
+        action_locker.cmd_lock(lock_args(min_age_days=None), repo)
+        assert load_lockfile(repo)["locked"]["steph-owl/action-locker@v1"]["resolved"] == self.SHA
+
+    def test_require_trusted_age_rejects_committer_date(self, tmp_path, monkeypatch, capsys):
+        repo = self._repo(tmp_path, policy={"require_trusted_age": True})
+        self._patch(monkeypatch, age_days=30)  # old, but heuristic source
+        with pytest.raises(SystemExit):
+            action_locker.cmd_lock(lock_args(min_age_days=None), repo)
+        out = capsys.readouterr().out
+        assert "requires a trusted source" in out
+
+    def test_require_trusted_age_accepts_merged_pr(self, tmp_path, monkeypatch):
+        repo = self._repo(tmp_path, policy={"require_trusted_age": True})
+        self._patch(monkeypatch, age_days=None, pr_age_days=30)
+        action_locker.cmd_lock(lock_args(min_age_days=None), repo)
+        assert load_lockfile(repo)["locked"]["x/y@v1"]["resolved"] == self.SHA
+
+    def test_unknown_policy_key_fails_closed(self, tmp_path, monkeypatch, capsys):
+        """A typo must not silently weaken the floor."""
+        repo = self._repo(tmp_path, policy={"min_age_dayz": 0})
+        self._patch(monkeypatch, age_days=30)
+        with pytest.raises(SystemExit):
+            action_locker.cmd_lock(lock_args(min_age_days=None), repo)
+        assert "unknown key `min_age_dayz`" in capsys.readouterr().err
+        assert load_lockfile(repo)["locked"] == {}
+
+    def test_verify_flags_malformed_policy(self, tmp_path, capsys):
+        sha = "2" * 40
+        wf = tmp_path / ".github" / "workflows"
+        wf.mkdir(parents=True)
+        wf.joinpath("ci.yml").write_text(
+            f"jobs:\n  a:\n    steps:\n      - uses: actions/checkout@{sha}\n"
+        )
+        data = {
+            "version": 1,
+            "locked": {"actions/checkout@v4": entry("actions/checkout", sha, "v4")},
+            "policy": {"overrides": [{"prefix": "no-slash"}]},
+        }
+        (tmp_path / "action-lock.json").write_text(json.dumps(data))
+        assert run_verify(tmp_path) == 1
+        assert "POLICY" in capsys.readouterr().out
+
+    def test_bool_is_not_a_valid_age(self, tmp_path, monkeypatch, capsys):
+        repo = self._repo(tmp_path, policy={"min_age_days": True})
+        self._patch(monkeypatch, age_days=30)
+        with pytest.raises(SystemExit):
+            action_locker.cmd_lock(lock_args(min_age_days=None), repo)
+        assert "must be a number" in capsys.readouterr().err
+
+
+# --- merged-PR rung of the trust ladder ---
+
+class TestMergedPrRung:
+    SHA = "6" * 40
+
+    def _repo(self, tmp_path):
+        wf = tmp_path / ".github" / "workflows"
+        wf.mkdir(parents=True)
+        wf.joinpath("ci.yml").write_text(
+            "jobs:\n  a:\n    steps:\n      - uses: x/y@v1\n"
+        )
+        write_lockfile(tmp_path, {})
+        return tmp_path
+
+    def _patch(self, monkeypatch, **ages):
+        monkeypatch.setattr(action_locker, "get_github_token", lambda: None)
+        monkeypatch.setattr(
+            action_locker, "resolve_ref_to_sha", lambda repo, ref, token=None: self.SHA
+        )
+        patch_commit_age(monkeypatch, **ages)
+
+    def test_old_merged_pr_beats_backdated_committer_date(self, tmp_path, monkeypatch, capsys):
+        """Fresh malicious commit merged just now, committer date backdated
+        100 days: PR merge date (server-side) wins -> refused."""
+        repo = self._repo(tmp_path)
+        self._patch(monkeypatch, age_days=100, pr_age_days=0.2)
+        with pytest.raises(SystemExit):
+            action_locker.cmd_lock(lock_args(), repo)
+        out = capsys.readouterr().out
+        assert "REFUSED" in out and "merged pull request" in out
+
+    def test_release_outranks_pr(self, tmp_path, monkeypatch, capsys):
+        repo = self._repo(tmp_path)
+        self._patch(monkeypatch, age_days=100, pr_age_days=100, release_age_days=0.2)
+        with pytest.raises(SystemExit):
+            action_locker.cmd_lock(lock_args(), repo)
+        assert "immutable release" in capsys.readouterr().out
+
+    def test_pr_rung_used_when_no_release(self, tmp_path, monkeypatch):
+        repo = self._repo(tmp_path)
+        self._patch(monkeypatch, age_days=None, pr_age_days=30)
+        action_locker.cmd_lock(lock_args(), repo)
+        assert load_lockfile(repo)["locked"]["x/y@v1"]["resolved"] == self.SHA
+
+    def test_pr_lookup_rejects_non_sha_without_network(self, monkeypatch):
+        import urllib.request
+
+        def boom(*a, **kw):
+            raise AssertionError("network request made with unvalidated sha")
+
+        monkeypatch.setattr(urllib.request, "urlopen", boom)
+        assert action_locker.get_earliest_merged_pr_date("x/y", "main") is None
+        assert action_locker.get_earliest_merged_pr_date("x/y", "6" * 39) is None
+
+
+# --- get_commit_date input validation ---
+
+class TestGetCommitDateValidation:
+    def test_rejects_non_sha_without_network(self, monkeypatch):
+        """A non-SHA value must be rejected locally, never interpolated
+        into the commits URL."""
+        import urllib.request
+
+        def boom(*a, **kw):
+            raise AssertionError("network request made with unvalidated sha")
+
+        monkeypatch.setattr(urllib.request, "urlopen", boom)
+        assert action_locker.get_commit_date("x/y", "v1/../../evil") is None
+        assert action_locker.get_commit_date("x/y", "main") is None
+        assert action_locker.get_commit_date("x/y", "6" * 39) is None
+
+    def test_release_lookup_without_tag_makes_no_network_call(self, monkeypatch):
+        import urllib.request
+
+        def boom(*a, **kw):
+            raise AssertionError("network request made with no tag")
+
+        monkeypatch.setattr(urllib.request, "urlopen", boom)
+        assert action_locker.get_release_published_at("x/y", None) is None
+        assert action_locker.get_release_published_at("x/y", "") is None
+
+
+# --- commit age floor (update --apply) ---
+
+def update_args(**overrides):
+    defaults = dict(apply=True, allow_fresh=False, min_age_days=5.0)
+    defaults.update(overrides)
+    return argparse.Namespace(**defaults)
+
+
+class TestUpdateApplyAgeFloor:
+    OLD_SHA = "6" * 40
+    NEW_SHA = "7" * 40
+
+    @pytest.fixture
+    def locked_repo(self, tmp_path):
+        """Repo with one 3rd-party action locked at OLD_SHA on tag v1."""
+        write_lockfile(
+            tmp_path,
+            {"x/y@v1": entry("x/y", self.OLD_SHA, "v1")},
+            trusted_prefixes=["Old-Well-Labs/"],
+        )
+        return tmp_path
+
+    def _patch(self, monkeypatch, age_days):
+        monkeypatch.setattr(action_locker, "get_github_token", lambda: None)
+        monkeypatch.setattr(
+            action_locker, "resolve_ref_to_sha", lambda repo, ref, token=None: self.NEW_SHA
+        )
+        patch_commit_age(monkeypatch, age_days)
+
+    def test_skips_fresh_commit(self, locked_repo, monkeypatch, capsys):
+        self._patch(monkeypatch, age_days=1)
+        action_locker.cmd_update(update_args(), locked_repo)
+        out = capsys.readouterr().out
+        assert "SKIPPED x/y" in out
+        assert "age floor" in out
+        lockdata = load_lockfile(locked_repo)
+        assert lockdata["locked"]["x/y@v1"]["resolved"] == self.OLD_SHA
+
+    def test_applies_aged_commit(self, locked_repo, monkeypatch, capsys):
+        self._patch(monkeypatch, age_days=30)
+        action_locker.cmd_update(update_args(), locked_repo)
+        assert "Updated x/y" in capsys.readouterr().out
+        lockdata = load_lockfile(locked_repo)
+        assert lockdata["locked"]["x/y@v1"]["resolved"] == self.NEW_SHA
+
+    def test_unknown_age_skips(self, locked_repo, monkeypatch, capsys):
+        self._patch(monkeypatch, age_days=None)
+        action_locker.cmd_update(update_args(), locked_repo)
+        assert "of unknown age" in capsys.readouterr().out
+        lockdata = load_lockfile(locked_repo)
+        assert lockdata["locked"]["x/y@v1"]["resolved"] == self.OLD_SHA
+
+    def test_allow_fresh_overrides_floor(self, locked_repo, monkeypatch):
+        self._patch(monkeypatch, age_days=0.1)
+        action_locker.cmd_update(update_args(allow_fresh=True), locked_repo)
+        lockdata = load_lockfile(locked_repo)
+        assert lockdata["locked"]["x/y@v1"]["resolved"] == self.NEW_SHA
+
+    def test_trusted_action_exempt(self, tmp_path, monkeypatch):
+        self._patch(monkeypatch, age_days=None)  # age lookup would skip
+
+        def boom(repo, sha, token=None):
+            raise AssertionError(f"age check ran for trusted repo {repo}")
+
+        monkeypatch.setattr(action_locker, "get_commit_date", boom)
+        write_lockfile(
+            tmp_path,
+            {"Old-Well-Labs/infra@main": entry("Old-Well-Labs/infra", self.OLD_SHA, "main")},
+            trusted_prefixes=["Old-Well-Labs/"],
+        )
+        action_locker.cmd_update(update_args(), tmp_path)
+        lockdata = load_lockfile(tmp_path)
+        assert lockdata["locked"]["Old-Well-Labs/infra@main"]["resolved"] == self.NEW_SHA
+
+    def test_invalid_trusted_prefix_warns(self, tmp_path, monkeypatch, capsys):
+        """An invalid trusted_prefixes entry must be surfaced, not silently
+        dropped — otherwise the resulting age-floor skip is unexplained."""
+        self._patch(monkeypatch, age_days=1)
+        write_lockfile(
+            tmp_path,
+            {"x/y@v1": entry("x/y", self.OLD_SHA, "v1")},
+            trusted_prefixes=["Old-Well-Labs"],  # missing '/'
+        )
+        action_locker.cmd_update(update_args(), tmp_path)
+        captured = capsys.readouterr()
+        assert "INVALID trusted_prefixes entry" in captured.err
+        assert "SKIPPED x/y" in captured.out

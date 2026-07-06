@@ -1,0 +1,10 @@
+- id: action-locker
+  name: action-locker verify
+  description: Verify GitHub Action refs are SHA-pinned, locked, and vendored copies intact
+  entry: action-locker verify
+  language: python
+  # Trigger on workflow edits, lockfile edits, AND vendored-tree edits —
+  # verify checks vendored content against integrity hashes, so a change
+  # under vendored-actions/ must re-run it.
+  files: ^(\.github/workflows/.*\.ya?ml|action-lock\.json|\.github/vendored-actions/.*)$
+  pass_filenames: false

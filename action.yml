@@ -5,7 +5,7 @@
 # of a second repo, pinned like anything else:
 #
 #   - uses: actions/checkout@<sha>          # your repo
-#   - uses: Old-Well-Labs/action-locker@<sha> # runs `action-locker verify`
+#   - uses: steph-owl/action-locker@<sha> # runs `action-locker verify`
 #
 # GitHub's action-fetch mechanism resolves this repo into the runner's
 # action cache; GITHUB_ACTION_PATH points there, while cwd stays in the

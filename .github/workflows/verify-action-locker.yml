@@ -4,7 +4,7 @@
 #
 #   jobs:
 #     action-locker:
-#       uses: Old-Well-Labs/action-locker/.github/workflows/verify-action-locker.yml@<sha>  # v1
+#       uses: steph-owl/action-locker/.github/workflows/verify-action-locker.yml@<sha>  # v1
 #
 # The verify step is fully offline (parses workflows + lockfile only), so it
 # is fast and adds no rate-limit or proxy concerns to CI.
@@ -14,7 +14,7 @@
 # caller pinned. Whatever SHA you pin the reusable workflow to is the SHA
 # of the verifier code you run. There is no `@v1`-style hop in the middle
 # to retarget. (job.workflow_* is unavailable on GitHub Enterprise Server;
-# use the composite action `Old-Well-Labs/action-locker@<sha>` there.)
+# use the composite action `steph-owl/action-locker@<sha>` there.)
 #
 # Note: this workflow itself pins actions/checkout by SHA, as action-locker
 # requires. Eat your own dog food.

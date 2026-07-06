@@ -37,8 +37,5 @@
       "tag": null
     }
   },
-  "trusted_prefixes": [
-    "Old-Well-Labs/"
-  ],
   "version": 1
 }

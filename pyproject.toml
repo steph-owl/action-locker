@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "action-locker"
+version = "0.9.0"
+description = "A lockfile for your GitHub Actions - and a locker for the ones you can't afford to lose"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+
+# Stdlib-only on purpose: this tool runs in CI and pre-commit environments
+# where every dependency is itself a supply-chain surface.
+dependencies = []
+
+[project.scripts]
+action-locker = "action_locker:main"
+
+[tool.setuptools]
+py-modules = ["action_locker"]

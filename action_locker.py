@@ -27,6 +27,15 @@ LOCKFILE_VERSION = 1
 VENDOR_DIR = ".github/vendored-actions"
 META_FILE = ".action-lock-meta.json"
 
+# Supply-chain quarantine: refuse to lock 3rd-party commits younger than this.
+# Compromised actions are usually caught within days of the malicious commit —
+# a brief age floor keeps you out of the blast window. trusted_prefixes are
+# exempt. Age source is a trust ladder (see ref_age_days): an immutable
+# release's server-side published_at when the tag has one (trusted — can't
+# be backdated, tag can't move), else the commit's committer date (git
+# metadata, backdatable — heuristic, not a wall). Unknown age fails closed.
+MIN_COMMIT_AGE_DAYS = 5
+
 # Matches: uses: owner/repo@ref  or  uses: owner/repo/path@ref
 USES_PATTERN = re.compile(
     r'uses:\s*["\']?(?P<action>[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+(?:/[a-zA-Z0-9_./%-]+)?)@(?P<ref>[a-zA-Z0-9._/-]+)["\']?'
@@ -175,11 +184,143 @@ def resolve_ref_to_sha(repo, ref, token=None):
                     with urllib.request.urlopen(tag_req) as tag_resp:
                         tag_data = json.loads(tag_resp.read())
                         sha = tag_data["object"]["sha"]
-                return sha
+                # Never return an unvalidated value from the API response —
+                # downstream callers interpolate this into URLs.
+                if is_sha(sha):
+                    return sha
         except urllib.error.HTTPError:
             continue
 
     return None
+
+
+def get_commit_date(repo, sha, token=None):
+    """Return the committer date of a commit as an aware datetime, or None.
+
+    `sha` is re-validated locally (defense in depth): it is interpolated
+    into the commits URL, so we never trust the caller to have validated it.
+
+    Note: committer dates are git metadata, settable by whoever made the
+    commit — treat the result as a heuristic, not proof of public existence.
+    """
+    if not is_sha(sha):
+        return None
+
+    import urllib.request
+    import urllib.error
+
+    headers = {"Accept": "application/vnd.github.v3+json"}
+    if token:
+        headers["Authorization"] = f"token {token}"
+
+    url = f"https://api.github.com/repos/{repo}/commits/{sha}"
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+        date_str = data["commit"]["committer"]["date"]
+        return datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+    except (urllib.error.URLError, KeyError, TypeError, ValueError, TimeoutError):
+        return None
+
+
+def commit_age_days(repo, sha, token=None):
+    """Age of a commit in days (float), or None if the date can't be determined."""
+    commit_date = get_commit_date(repo, sha, token)
+    if commit_date is None:
+        return None
+    return (datetime.now(timezone.utc) - commit_date).total_seconds() / 86400
+
+
+def get_release_published_at(repo, tag, token=None):
+    """`published_at` of an IMMUTABLE release for `tag`, else None.
+
+    Immutable releases freeze the tag→commit binding and `published_at` is
+    set by GitHub's servers — an attacker can neither backdate it nor move
+    the tag afterward, so it's a *trusted* age signal. A mutable release's
+    published_at proves nothing (the tag can move after publication — that
+    is exactly the tj-actions attack), so those are ignored.
+    """
+    if not tag:
+        return None
+
+    import urllib.request
+    import urllib.error
+    import urllib.parse
+
+    headers = {"Accept": "application/vnd.github.v3+json"}
+    if token:
+        headers["Authorization"] = f"token {token}"
+
+    url = f"https://api.github.com/repos/{repo}/releases/tags/{urllib.parse.quote(tag, safe='')}"
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+        if data.get("immutable") is True and data.get("published_at"):
+            return datetime.fromisoformat(data["published_at"].replace("Z", "+00:00"))
+    except (urllib.error.URLError, KeyError, TypeError, ValueError, TimeoutError):
+        return None
+    return None
+
+
+def get_earliest_merged_pr_date(repo, sha, token=None):
+    """Earliest server-side `merged_at` among PRs containing this commit,
+    or None.
+
+    A merge timestamp is recorded by GitHub's servers: an attacker can't
+    retroactively insert a new commit into an old merged PR, and merging a
+    fresh PR stamps `merged_at` = now. `created_at` is deliberately NOT
+    used (an old open PR can receive new commits). Unmerged PRs are skipped.
+    """
+    if not is_sha(sha):
+        return None
+
+    import urllib.request
+    import urllib.error
+
+    headers = {"Accept": "application/vnd.github.v3+json"}
+    if token:
+        headers["Authorization"] = f"token {token}"
+
+    url = f"https://api.github.com/repos/{repo}/commits/{sha}/pulls"
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+        dates = [
+            datetime.fromisoformat(pr["merged_at"].replace("Z", "+00:00"))
+            for pr in data
+            if isinstance(pr, dict) and pr.get("merged_at")
+        ]
+        return min(dates) if dates else None
+    except (urllib.error.URLError, KeyError, TypeError, ValueError, TimeoutError):
+        return None
+
+
+def ref_age_days(repo, sha, tag=None, token=None):
+    """Best-available age of a ref in days: (age, source, trusted) or
+    (None, None, False).
+
+    Trust ladder:
+      1. Immutable-release `published_at` (server clock, tag frozen) —
+         when the ref came from a tag that has one. TRUSTED.
+      2. Earliest merged-PR `merged_at` containing the commit (server
+         clock). TRUSTED.
+      3. Commit committer date (git metadata — heuristic, backdatable).
+         NOT trusted; accepted unless policy says require_trusted_age.
+    """
+    date = get_release_published_at(repo, tag, token)
+    source, trusted = "immutable release", True
+    if date is None:
+        date = get_earliest_merged_pr_date(repo, sha, token)
+        source, trusted = "merged pull request", True
+    if date is None:
+        date = get_commit_date(repo, sha, token)
+        source, trusted = "committer date", False
+    if date is None:
+        return None, None, False
+    return (datetime.now(timezone.utc) - date).total_seconds() / 86400, source, trusted
 
 
 def load_lockfile(repo_root):
@@ -226,7 +367,7 @@ def normalize_trusted_prefixes(prefixes):
     boundary (e.g. "actions" would otherwise trust "actions-evil/foo").
     Prefixes are normalized to end in '/' and matched against the action
     reference with a trailing '/' appended, so both owner prefixes
-    ("Old-Well-Labs/") and full-repo prefixes ("aws-actions/configure-aws-credentials")
+    ("your-org/") and full-repo prefixes ("aws-actions/configure-aws-credentials")
     match exactly at path-segment boundaries.
 
     Returns (normalized_prefixes, errors).
@@ -248,6 +389,121 @@ def is_trusted(action, trusted_prefixes):
     """Check a (normalized) trusted prefix list against an action reference,
     matching only at full path-segment boundaries."""
     return any((action + "/").startswith(p) for p in trusted_prefixes)
+
+
+def normalize_policy(lockdata):
+    """Validate and normalize the lockfile `policy` block.
+
+    Shape (all keys optional):
+
+      "policy": {
+        "min_age_days": 5,
+        "require_trusted_age": false,
+        "overrides": [
+          {"prefix": "your-org/hot-repo", "min_age_days": 0},
+          {"prefix": "somevendor/", "require_trusted_age": true}
+        ]
+      }
+
+    Policy lives in the lockfile ON PURPOSE: it's PR-reviewed and
+    CODEOWNERS-able, unlike org/repo/env variables, whose precedence lets
+    anyone with repo write silently override what an org admin set.
+
+    Unknown keys are ERRORS, not warnings — a typo like "min_age_dayz"
+    must not silently weaken the floor. Prefixes follow the same
+    owner-boundary rules as trusted_prefixes. Returns (policy, errors)
+    where policy = {"min_age_days": float, "require_trusted_age": bool,
+    "overrides": [(prefix, {...}), ...] sorted most-specific-first}.
+    """
+    default = {
+        "min_age_days": float(MIN_COMMIT_AGE_DAYS),
+        "require_trusted_age": False,
+        "overrides": [],
+    }
+    raw = lockdata.get("policy")
+    if raw is None:
+        return default, []
+    errors = []
+    if not isinstance(raw, dict):
+        return default, ["POLICY: `policy` must be an object"]
+
+    def check_keys(obj, allowed, where):
+        for k in obj:
+            if k not in allowed:
+                errors.append(
+                    f"POLICY: unknown key `{k}` in {where} — "
+                    f"a typo here would silently weaken the age floor"
+                )
+
+    def check_age(value, where):
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
+            errors.append(f"POLICY: `min_age_days` in {where} must be a number >= 0")
+            return None
+        return float(value)
+
+    def check_flag(value, where):
+        if not isinstance(value, bool):
+            errors.append(f"POLICY: `require_trusted_age` in {where} must be true/false")
+            return None
+        return value
+
+    check_keys(raw, {"min_age_days", "require_trusted_age", "overrides"}, "policy")
+    policy = dict(default)
+    if "min_age_days" in raw:
+        v = check_age(raw["min_age_days"], "policy")
+        if v is not None:
+            policy["min_age_days"] = v
+    if "require_trusted_age" in raw:
+        v = check_flag(raw["require_trusted_age"], "policy")
+        if v is not None:
+            policy["require_trusted_age"] = v
+
+    overrides = []
+    raw_overrides = raw.get("overrides", [])
+    if not isinstance(raw_overrides, list):
+        errors.append("POLICY: `overrides` must be a list")
+        raw_overrides = []
+    for i, ov in enumerate(raw_overrides):
+        where = f"policy.overrides[{i}]"
+        if not isinstance(ov, dict):
+            errors.append(f"POLICY: {where} must be an object")
+            continue
+        check_keys(ov, {"prefix", "min_age_days", "require_trusted_age"}, where)
+        prefix = ov.get("prefix")
+        if not isinstance(prefix, str) or "/" not in prefix:
+            errors.append(
+                f"POLICY: {where} needs a `prefix` containing '/' "
+                f"(owner-boundary matching requires it)"
+            )
+            continue
+        normalized = prefix if prefix.endswith("/") else prefix + "/"
+        entry = {}
+        if "min_age_days" in ov:
+            v = check_age(ov["min_age_days"], where)
+            if v is not None:
+                entry["min_age_days"] = v
+        if "require_trusted_age" in ov:
+            v = check_flag(ov["require_trusted_age"], where)
+            if v is not None:
+                entry["require_trusted_age"] = v
+        overrides.append((normalized, entry))
+
+    # Most-specific prefix wins, independent of file order
+    overrides.sort(key=lambda item: len(item[0]), reverse=True)
+    policy["overrides"] = overrides
+    return policy, errors
+
+
+def effective_policy(action, policy):
+    """(min_age_days, require_trusted_age) for one action reference,
+    applying the most specific matching override."""
+    for prefix, ov in policy["overrides"]:
+        if (action + "/").startswith(prefix):
+            return (
+                ov.get("min_age_days", policy["min_age_days"]),
+                ov.get("require_trusted_age", policy["require_trusted_age"]),
+            )
+    return policy["min_age_days"], policy["require_trusted_age"]
 
 
 def owner_repo_of(action):
@@ -307,6 +563,22 @@ def cmd_lock(args, repo_root):
         print("Set GITHUB_TOKEN or run `gh auth login`.", file=sys.stderr)
 
     lockdata = load_lockfile(repo_root)
+    trusted_prefixes, prefix_errors = normalize_trusted_prefixes(
+        lockdata.get("trusted_prefixes", [])
+    )
+    for e in prefix_errors:
+        print(f"Warning: {e}", file=sys.stderr)
+    # A malformed policy must stop the lock, not silently lose its floors.
+    policy, policy_errors = normalize_policy(lockdata)
+    if policy_errors:
+        for e in policy_errors:
+            print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    # Programmatic callers (tests, other tools) may pass a bare Namespace —
+    # default the age-floor knobs instead of raising AttributeError. The CLI
+    # always sets both. An explicit --min-age-days beats lockfile policy.
+    allow_fresh = getattr(args, "allow_fresh", False)
+    min_age_cli = getattr(args, "min_age_days", None)
     updated = 0
     failed = 0
 
@@ -329,6 +601,36 @@ def cmd_lock(args, repo_root):
             failed += 1
             continue
 
+        # Age floor: quarantine fresh 3rd-party commits (see MIN_COMMIT_AGE_DAYS).
+        # Trusted prefixes (internal actions) are exempt.
+        if not allow_fresh and not is_trusted(action, trusted_prefixes):
+            eff_min, eff_require = effective_policy(action, policy)
+            min_age = min_age_cli if min_age_cli is not None else eff_min
+            tag_name = ref if not is_sha(ref) else None
+            age, age_source, age_trusted = ref_age_days(or_key, sha, tag_name, token)
+            if age is None:
+                print(
+                    f"FAILED (could not determine commit age for {sha[:12]}; "
+                    f"use --allow-fresh to skip the age check)"
+                )
+                failed += 1
+                continue
+            if eff_require and not age_trusted:
+                print(
+                    f"REFUSED ({sha[:12]} age comes from {age_source} — policy "
+                    f"requires a trusted source (immutable release or merged PR); "
+                    f"vendor + review then --allow-fresh, or fix upstream)"
+                )
+                failed += 1
+                continue
+            if age < min_age:
+                print(
+                    f"REFUSED ({sha[:12]} is {age:.1f} days old by {age_source}, "
+                    f"below the {min_age}-day age floor; use --allow-fresh to override)"
+                )
+                failed += 1
+                continue
+
         new_entry = {
             "resolved": sha,
             "tag": ref if not is_sha(ref) else None,
@@ -347,6 +649,9 @@ def cmd_lock(args, repo_root):
 
     save_lockfile(repo_root, lockdata)
     print(f"\nLocked {updated} actions ({failed} failed, {len(lockdata['locked']) - updated} unchanged)")
+    if failed:
+        # A partial lock must not look like success in CI.
+        sys.exit(1)
 
 
 def cmd_verify(args, repo_root):
@@ -361,7 +666,7 @@ def cmd_verify(args, repo_root):
     errors = []
     warnings = []
 
-    # Trusted prefixes (e.g. "Old-Well-Labs/") may use mutable refs like @main.
+    # Trusted prefixes (e.g. "your-org/") may use mutable refs like @main.
     # Typical use: internal reusable workflows where SHA-pinning would mean a
     # cross-repo update on every shared-workflow change. Warned, not errored.
     # Prefixes are validated to contain '/' — a bare "actions" entry would
@@ -370,6 +675,11 @@ def cmd_verify(args, repo_root):
         lockdata.get("trusted_prefixes", [])
     )
     errors.extend(prefix_errors)
+
+    # Validate the policy block too: verify is the gate where a malformed
+    # policy (which would weaken the NEXT lock/update) gets caught in CI.
+    _, policy_errors = normalize_policy(lockdata)
+    errors.extend(policy_errors)
 
     for action_ref, locations in sorted(actions.items()):
         action, ref = action_ref.rsplit("@", 1)
@@ -652,18 +962,65 @@ def cmd_update(args, repo_root):
             print(f"  {u['action']}@{u['tag']}: {u['current'][:12]} -> {u['latest'][:12]}")
 
         if args.apply:
+            # Surface invalid trusted_prefixes entries just like cmd_lock():
+            # silently dropping one would remove the trusted exemption and
+            # cause unexplained age-floor skips.
+            trusted_prefixes, prefix_errors = normalize_trusted_prefixes(
+                lockdata.get("trusted_prefixes", [])
+            )
+            for e in prefix_errors:
+                print(f"Warning: {e}", file=sys.stderr)
+            policy, policy_errors = normalize_policy(lockdata)
+            if policy_errors:
+                for e in policy_errors:
+                    print(f"Error: {e}", file=sys.stderr)
+                sys.exit(1)
+            allow_fresh = getattr(args, "allow_fresh", False)
+            min_age_cli = getattr(args, "min_age_days", None)
             print("\nApplying updates...")
+            applied = 0
             revendor_needed = False
             for u in outdated:
+                # Same age floor as `lock`: don't move a pin onto a fresh
+                # 3rd-party commit.
+                if not allow_fresh and not is_trusted(u["action"], trusted_prefixes):
+                    eff_min, eff_require = effective_policy(u["action"], policy)
+                    min_age = min_age_cli if min_age_cli is not None else eff_min
+                    age, age_source, age_trusted = ref_age_days(
+                        owner_repo_of(u["action"]), u["latest"], u.get("tag"), token
+                    )
+                    if eff_require and age is not None and not age_trusted:
+                        print(
+                            f"  SKIPPED {u['action']}: age source is {age_source} — "
+                            f"policy requires a trusted source (immutable release "
+                            f"or merged PR); --allow-fresh to override"
+                        )
+                        continue
+                    if age is None or age < min_age:
+                        age_desc = (
+                            f"{age:.1f} days old by {age_source}"
+                            if age is not None else "of unknown age"
+                        )
+                        print(
+                            f"  SKIPPED {u['action']}: {u['latest'][:12]} is {age_desc} "
+                            f"(below {min_age}-day age floor; --allow-fresh to override)"
+                        )
+                        continue
                 entry = lockdata["locked"][u["ref"]]
                 entry["resolved"] = u["latest"]
                 entry["locked_at"] = datetime.now(timezone.utc).isoformat()
                 # The recorded integrity belongs to the OLD sha's content.
+                # (Only for entries actually applied — a SKIPPED action keeps
+                # its pin AND its integrity hash.)
                 if entry.get("integrity"):
                     entry["integrity"] = None
                     revendor_needed = True
                 print(f"  Updated {u['action']} -> {u['latest'][:12]}")
-            save_lockfile(repo_root, lockdata)
+                applied += 1
+            if applied:
+                save_lockfile(repo_root, lockdata)
+            else:
+                print("No updates applied.")
             if revendor_needed:
                 print(
                     "\nNote: integrity hashes were cleared for updated actions.\n"
@@ -733,6 +1090,15 @@ def main():
     # lock
     lock_parser = subparsers.add_parser("lock", help="Resolve action refs to SHAs and write lockfile")
     lock_parser.add_argument("--force", action="store_true", help="Re-resolve already locked actions")
+    lock_parser.add_argument(
+        "--min-age-days", type=float, default=None, metavar="N",
+        help=f"Refuse to lock 3rd-party commits younger than N days "
+             f"(default: lockfile policy, else {MIN_COMMIT_AGE_DAYS})",
+    )
+    lock_parser.add_argument(
+        "--allow-fresh", action="store_true",
+        help="Skip the commit age floor (use only when you've reviewed the commit)",
+    )
 
     # verify
     subparsers.add_parser("verify", help="Check that all workflow refs match the lockfile")
@@ -744,6 +1110,15 @@ def main():
     # update
     update_parser = subparsers.add_parser("update", help="Check for updates to locked actions")
     update_parser.add_argument("--apply", action="store_true", help="Apply available updates to lockfile")
+    update_parser.add_argument(
+        "--min-age-days", type=float, default=None, metavar="N",
+        help=f"Refuse to update onto 3rd-party commits younger than N days "
+             f"(default: lockfile policy, else {MIN_COMMIT_AGE_DAYS})",
+    )
+    update_parser.add_argument(
+        "--allow-fresh", action="store_true",
+        help="Skip the commit age floor (use only when you've reviewed the commit)",
+    )
 
     # rewrite
     subparsers.add_parser("rewrite", help="Rewrite workflow files to use pinned SHAs from lockfile")
