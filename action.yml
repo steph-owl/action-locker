@@ -1,0 +1,21 @@
+# Composite action: verify the calling repo's workflows against its
+# action-lock.json. Runs fully offline (parses workflows + lockfile only).
+#
+# This is the simplest way to consume action-locker — one step, no checkout
+# of a second repo, pinned like anything else:
+#
+#   - uses: actions/checkout@<sha>          # your repo
+#   - uses: Old-Well-Labs/action-locker@<sha> # runs `action-locker verify`
+#
+# GitHub's action-fetch mechanism resolves this repo into the runner's
+# action cache; GITHUB_ACTION_PATH points there, while cwd stays in the
+# caller repo's workspace.
+name: action-locker-verify
+description: Verify workflow action pins against action-lock.json (offline, no tokens)
+
+runs:
+  using: composite
+  steps:
+    - name: Verify action pins against lockfile
+      shell: bash
+      run: python3 "${GITHUB_ACTION_PATH}/action_locker.py" verify

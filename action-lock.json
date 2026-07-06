@@ -1,0 +1,44 @@
+{
+  "locked": {
+    "actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5": {
+      "locations": [
+        {
+          "file": ".github/workflows/ci.yml",
+          "line": 15
+        },
+        {
+          "file": ".github/workflows/dispatch-reverify.yml",
+          "line": 42
+        },
+        {
+          "file": ".github/workflows/verify-action-locker.yml",
+          "line": 35
+        },
+        {
+          "file": ".github/workflows/verify-action-locker.yml",
+          "line": 38
+        }
+      ],
+      "locked_at": "2026-07-06T20:08:35.240324+00:00",
+      "repo": "actions/checkout",
+      "resolved": "34e114876b0b11c390a56381ad16ebd13914f8d5",
+      "tag": null
+    },
+    "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065": {
+      "locations": [
+        {
+          "file": ".github/workflows/ci.yml",
+          "line": 16
+        }
+      ],
+      "locked_at": "2026-07-06T20:08:35.240346+00:00",
+      "repo": "actions/setup-python",
+      "resolved": "a26af69be951a213d495a4c3e4e4022e16d87065",
+      "tag": null
+    }
+  },
+  "trusted_prefixes": [
+    "Old-Well-Labs/"
+  ],
+  "version": 1
+}

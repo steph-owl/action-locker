@@ -1,0 +1,8 @@
+# Repos that receive `action-lock-reverify` repository_dispatch events from
+# the dispatch-reverify workflow. One owner/name per line; '#' comments and
+# blank lines ignored. Each listed repo must have a workflow with:
+#   on: { repository_dispatch: { types: [action-lock-reverify] } }
+#
+# Add your consumer repos here, e.g.:
+#   your-org/your-app
+Old-Well-Labs/action-locker-demo

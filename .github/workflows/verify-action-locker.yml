@@ -1,0 +1,45 @@
+# Reusable workflow: verify a repo's workflows against its action-lock.json.
+#
+# Consumer repos call this like (pin the ref to a SHA, of course):
+#
+#   jobs:
+#     action-locker:
+#       uses: Old-Well-Labs/action-locker/.github/workflows/verify-action-locker.yml@<sha>  # v1
+#
+# The verify step is fully offline (parses workflows + lockfile only), so it
+# is fast and adds no rate-limit or proxy concerns to CI.
+#
+# Self-pinning, no mutable indirection: the tool source is checked out at
+# `job.workflow_sha` — the exact commit of THIS workflow file that the
+# caller pinned. Whatever SHA you pin the reusable workflow to is the SHA
+# of the verifier code you run. There is no `@v1`-style hop in the middle
+# to retarget. (job.workflow_* is unavailable on GitHub Enterprise Server;
+# use the composite action `Old-Well-Labs/action-locker@<sha>` there.)
+#
+# Note: this workflow itself pins actions/checkout by SHA, as action-locker
+# requires. Eat your own dog food.
+
+name: verify-action-locker
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out caller repo
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - name: Check out action-locker at this workflow's own pinned SHA
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .action-locker-tool
+
+      - name: Verify action pins against lockfile
+        run: python3 .action-locker-tool/action_locker.py verify

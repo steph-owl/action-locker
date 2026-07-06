@@ -1,0 +1,73 @@
+# Fan-out: push re-verification to subscribed repos.
+#
+# When the lock/verify logic changes (action_locker.py or the reusable verify
+# workflow), consumer repos should re-run their action-locker check even though
+# nothing changed on their side. This workflow sends a `repository_dispatch`
+# event (type: action-lock-reverify) to every repo listed in subscribers.txt.
+#
+# Consumer repos opt in by adding to their workflow:
+#
+#   on:
+#     repository_dispatch:
+#       types: [action-lock-reverify]
+#
+# Cross-repo dispatch cannot use the default GITHUB_TOKEN (it is scoped to
+# this repo only). It requires a token with `contents: write` (fine-grained
+# "Contents" read/write grants the dispatches endpoint) on the subscriber
+# repos, stored as the ACTION_LOCK_DISPATCH_TOKEN secret. The job fails
+# loudly if the secret is missing rather than silently dispatching nothing.
+
+name: dispatch-reverify
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: "Single repo (owner/name) to dispatch to; empty = all of subscribers.txt"
+        type: string
+        default: ""
+  push:
+    branches: [main]
+    paths:
+      - action_locker.py
+      - .github/workflows/verify-action-locker.yml
+
+permissions:
+  contents: read
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - name: Send repository_dispatch to subscribers
+        env:
+          GH_TOKEN: ${{ secrets.ACTION_LOCK_DISPATCH_TOKEN }}
+          TARGET_REPO: ${{ inputs.repo }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "::error::ACTION_LOCK_DISPATCH_TOKEN secret is not set — cannot dispatch cross-repo. See header comment in this workflow."
+            exit 1
+          fi
+
+          if [ -n "${TARGET_REPO}" ]; then
+            repos="${TARGET_REPO}"
+          else
+            repos=$(grep -Ev '^\s*(#|$)' subscribers.txt)
+          fi
+
+          failed=0
+          for repo in ${repos}; do
+            echo "Dispatching action-lock-reverify -> ${repo}"
+            if ! gh api "repos/${repo}/dispatches" \
+                -f event_type=action-lock-reverify \
+                -f "client_payload[source]=Old-Well-Labs/action-locker" \
+                -f "client_payload[source_sha]=${GITHUB_SHA}"; then
+              echo "::error::Dispatch to ${repo} failed"
+              failed=1
+            fi
+          done
+          exit "${failed}"
