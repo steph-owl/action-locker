@@ -1051,6 +1051,49 @@ class TestPolicy:
         action_locker.cmd_lock(lock_args(min_age_days=None), repo)
         assert load_lockfile(repo)["locked"]["x/y@v1"]["resolved"] == self.SHA
 
+    def test_quarantine_gif_scenario_override_beats_policy_floor(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Regression-locks the quarantine.tape narration: a 9999-day floor
+        set in lockfile POLICY refuses third-party actions while the
+        steph-owl per-prefix override (0 days) walks through green. An
+        explicit CLI --min-age-days would beat policy and refuse both —
+        which is exactly why the tape must not use the flag."""
+        sha = "7" * 40
+        wf = tmp_path / ".github" / "workflows"
+        wf.mkdir(parents=True)
+        wf.joinpath("ci.yml").write_text(
+            "jobs:\n  a:\n    steps:\n"
+            "      - uses: x/y@v4\n"
+            f"      - uses: steph-owl/action-locker@{sha}\n"
+        )
+        data = {"version": 1, "locked": {}, "policy": {
+            "min_age_days": 9999,
+            "overrides": [{"prefix": "steph-owl/action-locker", "min_age_days": 0}],
+        }}
+        (tmp_path / "action-lock.json").write_text(json.dumps(data))
+        monkeypatch.setattr(action_locker, "get_github_token", lambda: None)
+        monkeypatch.setattr(
+            action_locker, "resolve_ref_to_sha", lambda repo, ref, token=None: sha
+        )
+        patch_commit_age(monkeypatch, age_days=30)
+
+        # Policy floor (no CLI flag): third-party refused, override passes
+        with pytest.raises(SystemExit):
+            action_locker.cmd_lock(lock_args(min_age_days=None, no_fallback=True), tmp_path)
+        out = capsys.readouterr().out
+        assert "REFUSED" in out
+        locked = load_lockfile(tmp_path)["locked"]
+        assert f"steph-owl/action-locker@{sha}" in locked
+        assert "x/y@v4" not in locked
+
+        # CLI flag steamrolls the override too — the gif's original sin
+        with pytest.raises(SystemExit):
+            action_locker.cmd_lock(
+                lock_args(min_age_days=9999.0, no_fallback=True, force=True), tmp_path
+            )
+        assert "REFUSED" in capsys.readouterr().out
+
     def test_unknown_policy_key_fails_closed(self, tmp_path, monkeypatch, capsys):
         """A typo must not silently weaken the floor."""
         repo = self._repo(tmp_path, policy={"min_age_dayz": 0})

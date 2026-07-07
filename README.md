@@ -1,6 +1,6 @@
 # action-locker
 
-_Created by Steph Prime at Old Well Labs_ [(we're hiring)](https://oldwell-labs.com/careers)
+_Created by Steph Prime at Old Well Labs_
 
 ## Who doesn't like demo gifs?
 ### Lock that SHA up!
@@ -54,8 +54,9 @@ should not arrive with its own supply chain. You can read every line of
 
 ### 1. Lock (`action-locker lock`)
 
-Scans `.github/workflows/*.yml`, resolves every `uses:` reference to an
-immutable commit SHA, and writes an `action-lock.json` lockfile recording
+Scans `.github/workflows/` (both `*.yml` and `*.yaml`), resolves every
+`uses:` reference to an immutable commit SHA, and writes an
+`action-lock.json` lockfile recording
 the SHA, the tag it came from, when it was locked, and where it's used:
 
 ```json
@@ -122,8 +123,6 @@ no network, no tokens), so it's fast and adds no rate-limit concerns:
   modified, added, or renamed file fails the build
 - No unexplained directories in the vendor tree
 - Warns on stale lockfile entries and un-hashed vendored copies
-
-![tampering with a vendored file fails the build](gifs/protect.gif)
 
 ### 5. Update (`action-locker update [--apply]`)
 
@@ -199,8 +198,6 @@ move after publication (that's exactly the tj-actions attack). And commit
 *signatures* don't help here either — the signature covers the
 attacker-chosen date; it proves who, not when.
 
-![the quarantine refusing fresh commits, ladder rungs named](gifs/quarantine.gif)
-
 ## What it protects against — and what it doesn't
 
 Honest threat model. Protects against:
@@ -236,7 +233,7 @@ Does **not** protect against:
 
 We all know by now how insecure GHA is by default. But you gotta make your devs happy - and this was my design solution to that. Now I can set "Require actions to be pinned to a full-length commit SHA" to `true` and my devs just see another pre-commit hook.
 
-There are other options in this problem space, and Github says they're going to do this natively eventually.
+There are other options in this problem space: [pinact](https://github.com/suzuki-shunsuke/pinact), [ratchet](https://github.com/sethvargo/ratchet), and [frizbee](https://github.com/stacklok/frizbee) rewrite tags to SHAs (pinners — no lockfile, nothing verified after the fact); [gh-actions-lockfile](https://github.com/gjtorikian/gh-actions-lockfile) and [ghasum](https://github.com/chains-project/ghasum) are real lockfiles with integrity hashing (and transitive resolution, which I don't do yet) — but none of them vendor, and the lockfile tools don't handle reusable workflows. Dependabot and Renovate keep pins fresh and pair nicely with the `# tag` comments `rewrite` leaves behind. And GitHub says they're going to do locking natively eventually — which still won't help when upstream disappears.
 
 But I've been using this pattern for a while now, and have been happy with it. The vendoring was important to me and it seemed differentiated enough to make this worth sharing.
 
@@ -271,7 +268,7 @@ intentionally track `@main` and SHA-pinning them would require a cross-repo
 update on every shared-workflow change. 
 
 If that's an issue, and you do not care about enabling the
-`Require actions to be pinned to a full-length commit SHA` , add a `trusted_prefixes` list to the lockfile to downgrade those from errors to warnings in `verify`:
+`Require actions to be pinned to a full-length commit SHA`, add a `trusted_prefixes` list to the lockfile to downgrade those from errors to warnings in `verify`:
 
 ```json
 {

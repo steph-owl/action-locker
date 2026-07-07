@@ -9,7 +9,11 @@ Each tape is one use case, ~30–45 seconds:
 |---|---|---|
 | `adopt.tape` | Pin an unpinned repo in three commands (the hero gif) | network + `GITHUB_TOKEN` |
 | `protect.tape` | Vendored-snapshot integrity: tamper → red, restore → green, un-pin → red | fully offline |
-| `quarantine.tape` | The age floor refusing fresh commits, trust-ladder sources, policy override passing | network + **public repos** (record last) |
+| `quarantine.tape` | A 9999-day floor set in lockfile *policy* refusing everything — except the org's own repo, whose per-prefix override genuinely wins | network + **public repos** (record last) |
+
+(quarantine's floor deliberately lives in the playground's lockfile, not a
+CLI flag: `--min-age-days` beats policy by documented precedence, which
+would refuse the override's repo too and make the captions lie.)
 
 ## Recording
 

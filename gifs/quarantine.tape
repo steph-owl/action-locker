@@ -1,6 +1,9 @@
-# quarantine.tape — the age floor: fresh commits are refused, with the
-# trust ladder naming its sources, and a policy override walking through
-# the front door.
+# quarantine.tape — the age floor refusing what hasn't aged, the trust
+# ladder naming its sources, and a policy override walking through the
+# front door — for real: the floor lives in the lockfile policy, so the
+# per-prefix override genuinely wins. (An explicit --min-age-days on the
+# CLI would beat policy and refuse the override's repo too — that's
+# documented precedence, and this gif must not contradict it.)
 #
 #   vhs gifs/quarantine.tape   (from the repo root; ../action-locker-demo
 #   sibling required; export GITHUB_TOKEN — the ladder queries release,
@@ -22,18 +25,21 @@ Set Padding 12
 Set TypingSpeed 30ms
 
 Hide
-Type "bash gifs/setup-playground.sh asis && cd /tmp/action-locker-playground && export PATH=$PWD/bin:$PATH && clear"
+Type "bash gifs/setup-playground.sh quarantine && cd /tmp/action-locker-playground && export PATH=$PWD/bin:$PATH && clear"
 Enter
 Sleep 4s
 Show
 
-Type "# The age floor: fresh targets are held back to older releases — and when"
+Type "# This lockfile's policy sets an absurd 9999-day age floor — with one exception:"
 Enter
-Type "# NOTHING clears the floor, you get refused. Cranked absurdly high, with"
+Type "grep -A9 policy action-lock.json"
+Sleep 500ms
 Enter
-Type "# hold-back off, so you can see the refusal path:"
+Sleep 4s
+
+Type "# Re-lock everything against that policy (hold-back off, to show refusals):"
 Enter
-Type "action-locker lock --force --min-age-days 9999 --no-fallback"
+Type "action-locker lock --force --no-fallback"
 Sleep 500ms
 Enter
 Sleep 15s
@@ -46,9 +52,9 @@ Type "#  1. Every REFUSED names its trust-ladder rung — immutable release and"
 Enter
 Type "#     merged-PR dates are GitHub-server-attested; committer dates are not."
 Enter
-Type "#  2. The org's own repo walked through anyway: the lockfile policy block"
+Type "#  2. The org's own repo walked through anyway: the most specific policy"
 Enter
-Type "#     gives steph-owl/action-locker a 0-day floor. Just that repo."
+Type "#     override wins, and steph-owl/action-locker carries a 0-day floor."
 Enter
 Type "#  3. The hint tells you your options — this is quarantine, not breakage."
 Enter
