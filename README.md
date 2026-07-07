@@ -1,10 +1,30 @@
 # action-locker
 
-A **lockfile** for your GitHub Actions and a **locker** for the ones you
-can't afford to lose. Pin, verify, and vendor, so your CI survives both
-supply chain attacks and upstream disappearance.
+_Created by Steph Prime at Old Well Labs_ [(we're hiring)](https://oldwell-labs.com/careers)
 
-![adopt an unpinned repo in three commands](gifs/adopt.gif)
+## Who doesn't like demo gifs?
+### Lock that SHA up!
+
+`action-locker` is a **lockfile** for your GitHub Actions and a **locker** for the ones you
+can't afford to lose. 
+
+Pin to a sha, verify the sha, and vendor critical repos, so your CI survives both
+supply chain attacks and upstream disappearance. 
+
+![lock that sha up!](gifs/adopt.gif)
+
+### Minimum age: Let other people be the beta testers for new releases
+
+`action-locker` has configurable settings for setting minimum age of actions to lock.
+If it's too new - it will find the newest one that is compliant and use that automatically.
+You can modify these settings to override age requirements for repos you own and trust.
+
+![age-gate-demo](gifs/quarantine.gif)
+
+### Vendoring Actions - Content Integrity Verification
+
+![protect](gifs/protect.gif)
+
 
 ## The problem
 
