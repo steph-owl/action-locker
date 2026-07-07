@@ -381,6 +381,51 @@ class TestRewrite:
         assert "already pinned" in capsys.readouterr().out
 
 
+# --- color output ---
+
+class TestColor:
+    def _green_repo(self, tmp_path):
+        sha = "2" * 40
+        wf = tmp_path / ".github" / "workflows"
+        wf.mkdir(parents=True)
+        wf.joinpath("ci.yml").write_text(
+            f"jobs:\n  a:\n    steps:\n      - uses: actions/checkout@{sha}\n"
+        )
+        write_lockfile(tmp_path, {"actions/checkout@v4": entry("actions/checkout", sha, "v4")})
+        return tmp_path
+
+    def _clean_env(self, monkeypatch):
+        for var in ("NO_COLOR", "FORCE_COLOR", "GITHUB_ACTIONS"):
+            monkeypatch.delenv(var, raising=False)
+
+    def test_plain_when_not_a_tty(self, tmp_path, monkeypatch, capsys):
+        self._clean_env(monkeypatch)
+        assert run_verify(self._green_repo(tmp_path)) == 0
+        assert "\x1b[" not in capsys.readouterr().out
+
+    def test_force_color_emits_ansi(self, tmp_path, monkeypatch, capsys):
+        self._clean_env(monkeypatch)
+        monkeypatch.setenv("FORCE_COLOR", "1")
+        assert run_verify(self._green_repo(tmp_path)) == 0
+        assert "\x1b[32m" in capsys.readouterr().out  # green success line
+
+    def test_no_color_always_wins(self, tmp_path, monkeypatch, capsys):
+        self._clean_env(monkeypatch)
+        monkeypatch.setenv("FORCE_COLOR", "1")
+        monkeypatch.setenv("NO_COLOR", "1")
+        assert run_verify(self._green_repo(tmp_path)) == 0
+        assert "\x1b[" not in capsys.readouterr().out
+
+    def test_github_actions_logs_get_color(self, tmp_path, monkeypatch, capsys):
+        self._clean_env(monkeypatch)
+        monkeypatch.setenv("GITHUB_ACTIONS", "true")
+        wf_repo = self._green_repo(tmp_path)
+        wf = wf_repo / ".github" / "workflows" / "ci.yml"
+        wf.write_text(wf.read_text().replace("@" + "2" * 40, "@v4"))
+        assert run_verify(wf_repo) == 1
+        assert "\x1b[31m" in capsys.readouterr().out  # red MUTABLE REF
+
+
 # --- security: vendored tree integrity ---
 
 class TestTreeHash:
@@ -557,6 +602,12 @@ def patch_commit_age(monkeypatch, age_days, release_age_days=None, pr_age_days=N
         action_locker, "get_earliest_merged_pr_date",
         lambda repo, sha, token=None: dated(pr_age_days),
     )
+    # No release series unless a test provides one — keeps hold-back
+    # selection (and its git ls-remote) off the network in every test.
+    monkeypatch.setattr(
+        action_locker, "list_series_tags",
+        lambda repo, ref, token=None: [],
+    )
 
 
 class TestLockForcePreservesIntegrity:
@@ -584,6 +635,89 @@ class TestLockForcePreservesIntegrity:
         monkeypatch.setattr(action_locker, "resolve_ref_to_sha", lambda *a, **kw: "4" * 40)
         cmd_lock(argparse.Namespace(force=True), tmp_path)
         assert "integrity" not in load_lockfile(tmp_path)["locked"]["x/y@v1"]
+
+
+class TestLocationsAreProvenanceNotIdentity:
+    """The lockfile locks content — (action, resolved SHA) — never position.
+    `locations` are breadcrumbs: verify ignores them; lock refreshes them."""
+
+    SHA = "3" * 40
+
+    def _pinned_repo(self, tmp_path, prefix_lines=""):
+        wf = tmp_path / ".github" / "workflows"
+        wf.mkdir(parents=True)
+        wf.joinpath("ci.yml").write_text(
+            prefix_lines
+            + f"jobs:\n  a:\n    steps:\n      - uses: x/y@{self.SHA}  # v1\n"
+        )
+        e = entry("x/y", self.SHA, "v1")
+        e["locations"] = [{"file": ".github/workflows/ci.yml", "line": 4}]
+        write_lockfile(tmp_path, {"x/y@v1": e})
+        return tmp_path
+
+    def test_inserted_lines_do_not_break_verify(self, tmp_path, capsys):
+        repo = self._pinned_repo(tmp_path, prefix_lines="# shifted\n\n\n\n\n")
+        assert run_verify(repo) == 0
+
+    def test_verify_reports_current_lines_not_lockfile_lines(self, tmp_path, capsys):
+        repo = self._pinned_repo(tmp_path, prefix_lines="\n" * 10)
+        wf = repo / ".github" / "workflows" / "ci.yml"
+        wf.write_text(wf.read_text().replace(f"x/y@{self.SHA}  # v1", "x/y@v1"))
+        assert run_verify(repo) == 1
+        out = capsys.readouterr().out
+        assert "ci.yml:14" in out  # fresh parse: 10 blank lines + line 4
+
+    def test_lock_refreshes_stale_locations(self, tmp_path, monkeypatch, capsys):
+        """Post-rewrite reality: workflow shows the SHA, the tag-keyed entry
+        still points at pre-rewrite lines. A plain lock (no --force, no
+        resolution needed) heals the breadcrumbs."""
+        repo = self._pinned_repo(tmp_path, prefix_lines="# pushed down\n\n\n")
+        monkeypatch.setenv("GITHUB_TOKEN", "test-token")
+        patch_commit_age(monkeypatch, 30)
+        from action_locker import cmd_lock
+
+        cmd_lock(argparse.Namespace(force=False), repo)
+        locs = load_lockfile(repo)["locked"]["x/y@v1"]["locations"]
+        assert locs == [{"file": ".github/workflows/ci.yml", "line": 7}]
+        assert "refreshed usage locations" in capsys.readouterr().out
+
+    def test_unused_entry_keeps_last_known_locations(self, tmp_path, monkeypatch):
+        repo = self._pinned_repo(tmp_path)
+        old = entry("gone/action", "9" * 40, "v2")
+        old["locations"] = [{"file": ".github/workflows/old.yml", "line": 3}]
+        data = json.loads((repo / "action-lock.json").read_text())
+        data["locked"]["gone/action@v2"] = old
+        (repo / "action-lock.json").write_text(json.dumps(data))
+        monkeypatch.setenv("GITHUB_TOKEN", "test-token")
+        patch_commit_age(monkeypatch, 30)
+        from action_locker import cmd_lock
+
+        cmd_lock(argparse.Namespace(force=False), repo)
+        locs = load_lockfile(repo)["locked"]["gone/action@v2"]["locations"]
+        assert locs == [{"file": ".github/workflows/old.yml", "line": 3}]
+
+
+class TestLockSkipsCoveredShaRefs:
+    def test_sha_ref_covered_by_tag_entry_is_not_relocked(self, tmp_path, monkeypatch, capsys):
+        """The lock-after-rewrite loop: workflows now reference SHAs that the
+        tag-keyed entries already cover. No duplicate entries, even --force."""
+        from action_locker import cmd_lock
+
+        sha = "3" * 40
+        wf = tmp_path / ".github" / "workflows"
+        wf.mkdir(parents=True)
+        wf.joinpath("ci.yml").write_text(
+            f"jobs:\n  a:\n    steps:\n      - uses: x/y@{sha}  # v1\n"
+        )
+        write_lockfile(tmp_path, {"x/y@v1": entry("x/y", sha, "v1")})
+        monkeypatch.setenv("GITHUB_TOKEN", "test-token")
+        patch_commit_age(monkeypatch, 30)
+
+        for force in (False, True):
+            cmd_lock(argparse.Namespace(force=force), tmp_path)
+            locked = load_lockfile(tmp_path)["locked"]
+            assert list(locked) == ["x/y@v1"], f"duplicate entry (force={force})"
+        assert "covered by x/y@v1" in capsys.readouterr().out
 
 
 class TestUpdateClearsIntegrity:
@@ -909,7 +1043,7 @@ class TestPolicy:
         with pytest.raises(SystemExit):
             action_locker.cmd_lock(lock_args(min_age_days=None), repo)
         out = capsys.readouterr().out
-        assert "requires a trusted source" in out
+        assert "trusted age source" in out
 
     def test_require_trusted_age_accepts_merged_pr(self, tmp_path, monkeypatch):
         repo = self._repo(tmp_path, policy={"require_trusted_age": True})
@@ -1003,6 +1137,188 @@ class TestMergedPrRung:
         monkeypatch.setattr(urllib.request, "urlopen", boom)
         assert action_locker.get_earliest_merged_pr_date("x/y", "main") is None
         assert action_locker.get_earliest_merged_pr_date("x/y", "6" * 39) is None
+
+
+# --- hold-back: the age floor rides the release series, not the user ---
+
+class TestHoldBack:
+    """A quarantine that fails CI trains everyone to --allow-fresh. Instead,
+    lock/update hold back to the newest same-series release clearing the
+    floor; REFUSED only when nothing qualifies."""
+
+    SHA_NEW = "a" * 40   # fresh tip of the series
+    SHA_MID = "b" * 40   # aged mid-series release
+    SHA_OLD = "c" * 40   # ancient
+
+    def _ages(self, monkeypatch, ages):
+        """ages: {sha: (age_days, source, trusted)}"""
+        def fake_ref_age(repo, sha, tag=None, token=None):
+            return ages.get(sha, (None, None, False))
+        monkeypatch.setattr(action_locker, "ref_age_days", fake_ref_age)
+
+    def _repo(self, tmp_path, policy=None):
+        wf = tmp_path / ".github" / "workflows"
+        wf.mkdir(parents=True)
+        wf.joinpath("ci.yml").write_text(
+            "jobs:\n  a:\n    steps:\n      - uses: x/y@v4\n"
+        )
+        data = {"version": 1, "locked": {}}
+        if policy is not None:
+            data["policy"] = policy
+        (tmp_path / "action-lock.json").write_text(json.dumps(data))
+        return tmp_path
+
+    def _patch(self, monkeypatch, series, ages):
+        monkeypatch.setattr(action_locker, "get_github_token", lambda: None)
+        monkeypatch.setattr(
+            action_locker, "resolve_ref_to_sha",
+            lambda repo, ref, token=None: self.SHA_NEW,
+        )
+        monkeypatch.setattr(
+            action_locker, "list_series_tags",
+            lambda repo, ref, token=None: list(series),
+        )
+        self._ages(monkeypatch, ages)
+
+    def test_lock_holds_back_to_newest_aged_release(self, tmp_path, monkeypatch, capsys):
+        repo = self._repo(tmp_path)
+        self._patch(
+            monkeypatch,
+            series=[("v4", self.SHA_NEW), ("v4.4.0", self.SHA_NEW),
+                    ("v4.3.0", self.SHA_MID), ("v4.2.0", self.SHA_OLD)],
+            ages={self.SHA_NEW: (1.0, "committer date", False),
+                  self.SHA_MID: (30.0, "immutable release", True),
+                  self.SHA_OLD: (300.0, "immutable release", True)},
+        )
+        action_locker.cmd_lock(lock_args(), repo)
+        entry_ = load_lockfile(repo)["locked"]["x/y@v4"]
+        assert entry_["resolved"] == self.SHA_MID   # newest that clears, not oldest
+        assert entry_["selected"] == "v4.3.0"
+        assert entry_["tag"] == "v4"                # tracking channel unchanged
+        out = capsys.readouterr().out
+        assert "held back to v4.3.0" in out
+
+    def test_lock_refuses_when_nothing_in_series_clears(self, tmp_path, monkeypatch, capsys):
+        repo = self._repo(tmp_path)
+        self._patch(
+            monkeypatch,
+            series=[("v4", self.SHA_NEW), ("v4.4.0", self.SHA_MID)],
+            ages={self.SHA_NEW: (1.0, "committer date", False),
+                  self.SHA_MID: (2.0, "committer date", False)},
+        )
+        with pytest.raises(SystemExit):
+            action_locker.cmd_lock(lock_args(), repo)
+        out = capsys.readouterr().out
+        assert "REFUSED" in out and "nothing in the `v4` series" in out
+
+    def test_no_fallback_flag_refuses_despite_aged_release(self, tmp_path, monkeypatch, capsys):
+        repo = self._repo(tmp_path)
+        self._patch(
+            monkeypatch,
+            series=[("v4", self.SHA_NEW), ("v4.3.0", self.SHA_MID)],
+            ages={self.SHA_NEW: (1.0, "committer date", False),
+                  self.SHA_MID: (30.0, "immutable release", True)},
+        )
+        with pytest.raises(SystemExit):
+            action_locker.cmd_lock(lock_args(no_fallback=True), repo)
+        assert "REFUSED" in capsys.readouterr().out
+
+    def test_policy_fallback_false_refuses(self, tmp_path, monkeypatch, capsys):
+        repo = self._repo(tmp_path, policy={"fallback": False})
+        self._patch(
+            monkeypatch,
+            series=[("v4", self.SHA_NEW), ("v4.3.0", self.SHA_MID)],
+            ages={self.SHA_NEW: (1.0, "committer date", False),
+                  self.SHA_MID: (30.0, "immutable release", True)},
+        )
+        with pytest.raises(SystemExit):
+            action_locker.cmd_lock(lock_args(min_age_days=None), repo)
+        assert "REFUSED" in capsys.readouterr().out
+
+    def test_unknown_age_candidate_is_skipped_not_fatal(self, tmp_path, monkeypatch):
+        repo = self._repo(tmp_path)
+        self._patch(
+            monkeypatch,
+            series=[("v4", self.SHA_NEW), ("v4.3.0", self.SHA_MID)],
+            ages={self.SHA_NEW: (None, None, False),      # undeterminable
+                  self.SHA_MID: (30.0, "merged pull request", True)},
+        )
+        action_locker.cmd_lock(lock_args(), repo)
+        assert load_lockfile(repo)["locked"]["x/y@v4"]["resolved"] == self.SHA_MID
+
+    def test_require_trusted_age_skips_heuristic_candidates(self, tmp_path, monkeypatch):
+        repo = self._repo(tmp_path, policy={"require_trusted_age": True})
+        self._patch(
+            monkeypatch,
+            series=[("v4", self.SHA_NEW), ("v4.3.0", self.SHA_MID),
+                    ("v4.2.0", self.SHA_OLD)],
+            ages={self.SHA_NEW: (1.0, "committer date", False),
+                  self.SHA_MID: (30.0, "committer date", False),   # aged but untrusted
+                  self.SHA_OLD: (300.0, "immutable release", True)},
+        )
+        action_locker.cmd_lock(lock_args(min_age_days=None), repo)
+        assert load_lockfile(repo)["locked"]["x/y@v4"]["resolved"] == self.SHA_OLD
+
+    def test_rewrite_comment_shows_selected(self, tmp_path):
+        wf = tmp_path / ".github" / "workflows"
+        wf.mkdir(parents=True)
+        wf.joinpath("ci.yml").write_text(
+            "jobs:\n  a:\n    steps:\n      - uses: x/y@v4\n"
+        )
+        e = entry("x/y", self.SHA_MID, "v4")
+        e["selected"] = "v4.3.0"
+        write_lockfile(tmp_path, {"x/y@v4": e})
+        cmd_rewrite(argparse.Namespace(), tmp_path)
+        content = (tmp_path / ".github" / "workflows" / "ci.yml").read_text()
+        assert f"uses: x/y@{self.SHA_MID}  # v4.3.0" in content
+
+    def test_update_apply_holds_back(self, tmp_path, monkeypatch, capsys):
+        write_lockfile(tmp_path, {"x/y@v4": entry("x/y", self.SHA_OLD, "v4")})
+        self._patch(
+            monkeypatch,
+            series=[("v4", self.SHA_NEW), ("v4.4.0", self.SHA_NEW),
+                    ("v4.3.0", self.SHA_MID)],
+            ages={self.SHA_NEW: (1.0, "committer date", False),
+                  self.SHA_MID: (10.0, "immutable release", True)},
+        )
+        action_locker.cmd_update(update_args(), tmp_path)
+        entry_ = load_lockfile(tmp_path)["locked"]["x/y@v4"]
+        assert entry_["resolved"] == self.SHA_MID
+        assert entry_["selected"] == "v4.3.0"
+        assert "held back to v4.3.0" in capsys.readouterr().out
+
+    def test_update_held_at_current_applies_nothing(self, tmp_path, monkeypatch, capsys):
+        write_lockfile(tmp_path, {"x/y@v4": entry("x/y", self.SHA_MID, "v4")})
+        self._patch(
+            monkeypatch,
+            series=[("v4", self.SHA_NEW), ("v4.3.0", self.SHA_MID)],
+            ages={self.SHA_NEW: (1.0, "committer date", False),
+                  self.SHA_MID: (30.0, "immutable release", True)},
+        )
+        action_locker.cmd_update(update_args(), tmp_path)
+        out = capsys.readouterr().out
+        assert "HELD x/y" in out and "No updates applied" in out
+        assert load_lockfile(tmp_path)["locked"]["x/y@v4"]["resolved"] == self.SHA_MID
+
+
+class TestListSeriesTags:
+    def test_boundary_prerelease_and_peeled_handling(self, monkeypatch):
+        lines = "\n".join([
+            f"{'1'*40}\trefs/tags/v4",
+            f"{'2'*40}\trefs/tags/v4.3.0",
+            f"{'3'*40}\trefs/tags/v4.3.0^{{}}",       # peeled commit wins
+            f"{'4'*40}\trefs/tags/v4.4.0-rc.1",       # prerelease: skipped
+            f"{'5'*40}\trefs/tags/v40.1.0",           # boundary: not v4 series
+            f"{'6'*40}\trefs/tags/v5",                # different series
+        ])
+
+        def fake_run(cmd, **kw):
+            assert cmd[:3] == ["git", "ls-remote", "--tags"]
+            return type("R", (), {"returncode": 0, "stdout": lines})()
+
+        monkeypatch.setattr(action_locker.subprocess, "run", fake_run)
+        tags = action_locker.list_series_tags("x/y", "v4")
+        assert tags == [("v4.3.0", "3" * 40), ("v4", "1" * 40)]
 
 
 # --- get_commit_date input validation ---

@@ -1,22 +1,24 @@
 #!/usr/bin/env bash
-# Build a scratch playground for recording demo/demo.tape.
+# Build a scratch playground for recording the gifs/ tapes.
+#
+#   bash gifs/setup-playground.sh adopt   # rewound: mutable tags, no lockfile, no vendor
+#   bash gifs/setup-playground.sh asis    # the demo repo exactly as committed
 #
 # Expects the demo repo checked out as a sibling of this repo:
 #   ../action-locker-demo
-#
-# The playground is the demo app rewound to its "before" state: mutable
-# tag refs, no lockfile, no vendored actions — so the recording shows the
-# full lock -> rewrite -> vendor -> verify lifecycle happening for real.
 set -euo pipefail
 
+MODE="${1:-adopt}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DEMO="${ROOT}/../action-locker-demo"
 PLAY="/tmp/action-locker-playground"
 
 [ -d "$DEMO" ] || { echo "error: expected demo repo at $DEMO" >&2; exit 1; }
+case "$MODE" in adopt|asis) ;; *) echo "error: mode must be adopt|asis" >&2; exit 1;; esac
 
 rm -rf "$PLAY"
 cp -r "$DEMO" "$PLAY"
+rm -rf "$PLAY/.git" "$PLAY/gifs"   # fresh history; no recording kit in the shot
 cp "$ROOT/action_locker.py" "$PLAY/"
 
 # A real `action-locker` command on PATH, so the recording reads naturally
@@ -29,9 +31,10 @@ chmod +x "$PLAY/bin/action-locker"
 
 cd "$PLAY"
 
-# Rewind: fresh unpinned ci.yml (the meta action-locker job is stripped —
-# it can't resolve until the tool repo is public, and it's not the story)
-cat > .github/workflows/ci.yml <<'YAML'
+if [ "$MODE" = "adopt" ]; then
+  # Rewind to the "before" state: mutable tags, no lockfile, no vendor dir.
+  # (The meta action-locker CI job is stripped — it isn't the adopt story.)
+  cat > .github/workflows/ci.yml <<'YAML'
 name: CI
 on:
   pull_request:
@@ -40,7 +43,7 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -48,7 +51,7 @@ jobs:
 
   deploy:
     needs: [test]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: github.ref == 'refs/heads/main'
     steps:
       - uses: actions/checkout@v4
@@ -58,7 +61,7 @@ jobs:
       - run: ./deploy.sh
 YAML
 
-cat > .github/workflows/release.yml <<'YAML'
+  cat > .github/workflows/release.yml <<'YAML'
 name: Release
 on:
   push:
@@ -66,7 +69,7 @@ on:
 
 jobs:
   publish:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -75,8 +78,14 @@ jobs:
           files: dist/*
 YAML
 
-rm -f action-lock.json
-rm -rf .github/vendored-actions
+  rm -f action-lock.json
+  rm -rf .github/vendored-actions
+fi
 
-echo "Playground ready: $PLAY"
-echo "Tip: export GITHUB_TOKEN (or \`gh auth login\`) before recording for clean output."
+git init -q -b main
+git config user.name "Demo Dev"
+git config user.email "dev@example.com"
+git add -A
+git commit -qm "baseline"
+
+echo "Playground ready: $PLAY (mode: $MODE)"

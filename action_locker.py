@@ -30,10 +30,10 @@ META_FILE = ".action-lock-meta.json"
 # Supply-chain quarantine: refuse to lock 3rd-party commits younger than this.
 # Compromised actions are usually caught within days of the malicious commit —
 # a brief age floor keeps you out of the blast window. trusted_prefixes are
-# exempt. Age source is a trust ladder (see ref_age_days): an immutable
-# release's server-side published_at when the tag has one (trusted — can't
-# be backdated, tag can't move), else the commit's committer date (git
-# metadata, backdatable — heuristic, not a wall). Unknown age fails closed.
+# exempt. Age source is a trust ladder (see ref_age_days): immutable-release
+# published_at, else earliest merged-PR date (both server-side, trusted),
+# else the commit's committer date (git metadata, backdatable — heuristic,
+# not a wall). Unknown age fails closed.
 MIN_COMMIT_AGE_DAYS = 5
 
 # Matches: uses: owner/repo@ref  or  uses: owner/repo/path@ref
@@ -43,6 +43,34 @@ USES_PATTERN = re.compile(
 
 # A full SHA-1 is 40 hex chars
 SHA_PATTERN = re.compile(r'^[0-9a-f]{40}$')
+
+
+# --- Color ---
+
+def _use_color():
+    """Color when a human is looking: a TTY, or GitHub Actions logs (which
+    render ANSI), or FORCE_COLOR. NO_COLOR always wins (no-color.org)."""
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("FORCE_COLOR") or os.environ.get("GITHUB_ACTIONS") == "true":
+        return True
+    return sys.stdout.isatty()
+
+
+def _paint(text, code):
+    return f"\x1b[{code}m{text}\x1b[0m" if _use_color() else text
+
+
+def red(text):
+    return _paint(text, "31")
+
+
+def green(text):
+    return _paint(text, "32")
+
+
+def yellow(text):
+    return _paint(text, "33")
 
 
 # --- Helpers ---
@@ -298,6 +326,120 @@ def get_earliest_merged_pr_date(repo, sha, token=None):
         return None
 
 
+def list_series_tags(repo, ref, token=None):
+    """Tags in `ref`'s release series, newest first, as [(tag, commit_sha)].
+
+    Series = the tag itself or `ref.`-prefixed descendants, so `v4` matches
+    `v4.3.0` but never `v40` (boundary-safe). Prerelease-looking tags
+    (containing '-') are skipped unless the ref itself has one. One
+    `git ls-remote --tags` call; annotated tags use their peeled (^{})
+    commit SHA. Ordering is a tolerant version sort — good enough to walk
+    a series newest-first, not a full semver implementation.
+
+    Returns [] for branch refs, exact-version refs with no descendants,
+    and unreachable repos — callers treat that as "no series to hold back
+    through."
+    """
+    try:
+        result = subprocess.run(
+            ["git", "ls-remote", "--tags", "--", f"https://github.com/{repo}.git"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return []
+    if result.returncode != 0:
+        return []
+
+    plain, peeled = {}, {}
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        sha, refname = parts
+        if not refname.startswith("refs/tags/") or not is_sha(sha):
+            continue
+        name = refname[len("refs/tags/"):]
+        if name.endswith("^{}"):
+            peeled[name[:-3]] = sha
+        else:
+            plain[name] = sha
+
+    series = {}
+    for name, sha in plain.items():
+        if name != ref and not name.startswith(ref + "."):
+            continue
+        if "-" in name and "-" not in ref:
+            continue  # prerelease-ish; hold back to real releases only
+        series[name] = peeled.get(name, sha)
+
+    def version_key(tag):
+        key = []
+        for chunk in re.split(r"[.\-]", tag):
+            bare = chunk.lstrip("v")
+            if bare.isdigit():
+                key.append((0, int(bare), ""))
+            else:
+                key.append((1, 0, chunk))
+        return key
+
+    ordered = sorted(series, key=version_key, reverse=True)
+    return [(t, series[t]) for t in ordered]
+
+
+def select_aged_target(repo, ref, resolved_sha, min_age, require_trusted,
+                       allow_fallback, token=None, max_candidates=8):
+    """Pick the newest target for `ref` that clears the age floor.
+
+    Candidate 0 is the ref's current target; when fallback is allowed and
+    the ref is a tag, older tags in the same series follow. This is what
+    keeps a 5-day quarantine livable: instead of failing CI on a fresh
+    release (and training everyone to reach for --allow-fresh), lock rides
+    the release series N days behind the edge.
+
+    Returns a dict:
+      ok:       True/False
+      sha, tag, age, source:  the chosen target        (ok=True)
+      held:     True when an older tag was chosen over the current target
+      newest_age, newest_source:  candidate 0's age     (for messages)
+      reason:   "fresh" | "unknown"                     (ok=False)
+    """
+    candidates = []
+    if resolved_sha:
+        candidates.append((ref, resolved_sha))
+    if allow_fallback and not is_sha(ref):
+        seen = {sha for _, sha in candidates}
+        for tag, sha in list_series_tags(repo, ref, token):
+            if sha not in seen:
+                candidates.append((tag, sha))
+                seen.add(sha)
+            if len(candidates) >= max_candidates:
+                break
+
+    newest_age = newest_source = None
+    any_unknown = False
+    for i, (cand_tag, cand_sha) in enumerate(candidates):
+        tag_arg = None if is_sha(cand_tag) else cand_tag
+        age, source, trusted_src = ref_age_days(repo, cand_sha, tag_arg, token)
+        if i == 0:
+            newest_age, newest_source = age, source
+        if age is None:
+            any_unknown = True
+            continue
+        if require_trusted and not trusted_src:
+            continue
+        if age >= min_age:
+            return {
+                "ok": True, "sha": cand_sha, "tag": cand_tag, "age": age,
+                "source": source, "held": i > 0,
+                "newest_age": newest_age, "newest_source": newest_source,
+            }
+    return {
+        "ok": False, "held": False,
+        "reason": "unknown" if (any_unknown and newest_age is None) else "fresh",
+        "newest_age": newest_age, "newest_source": newest_source,
+    }
+
+
 def ref_age_days(repo, sha, tag=None, token=None):
     """Best-available age of a ref in days: (age, source, trusted) or
     (None, None, False).
@@ -418,6 +560,7 @@ def normalize_policy(lockdata):
     default = {
         "min_age_days": float(MIN_COMMIT_AGE_DAYS),
         "require_trusted_age": False,
+        "fallback": True,
         "overrides": [],
     }
     raw = lockdata.get("policy")
@@ -441,22 +584,26 @@ def normalize_policy(lockdata):
             return None
         return float(value)
 
-    def check_flag(value, where):
+    def check_flag(value, name, where):
         if not isinstance(value, bool):
-            errors.append(f"POLICY: `require_trusted_age` in {where} must be true/false")
+            errors.append(f"POLICY: `{name}` in {where} must be true/false")
             return None
         return value
 
-    check_keys(raw, {"min_age_days", "require_trusted_age", "overrides"}, "policy")
+    check_keys(raw, {"min_age_days", "require_trusted_age", "fallback", "overrides"}, "policy")
     policy = dict(default)
     if "min_age_days" in raw:
         v = check_age(raw["min_age_days"], "policy")
         if v is not None:
             policy["min_age_days"] = v
     if "require_trusted_age" in raw:
-        v = check_flag(raw["require_trusted_age"], "policy")
+        v = check_flag(raw["require_trusted_age"], "require_trusted_age", "policy")
         if v is not None:
             policy["require_trusted_age"] = v
+    if "fallback" in raw:
+        v = check_flag(raw["fallback"], "fallback", "policy")
+        if v is not None:
+            policy["fallback"] = v
 
     overrides = []
     raw_overrides = raw.get("overrides", [])
@@ -468,7 +615,7 @@ def normalize_policy(lockdata):
         if not isinstance(ov, dict):
             errors.append(f"POLICY: {where} must be an object")
             continue
-        check_keys(ov, {"prefix", "min_age_days", "require_trusted_age"}, where)
+        check_keys(ov, {"prefix", "min_age_days", "require_trusted_age", "fallback"}, where)
         prefix = ov.get("prefix")
         if not isinstance(prefix, str) or "/" not in prefix:
             errors.append(
@@ -483,9 +630,13 @@ def normalize_policy(lockdata):
             if v is not None:
                 entry["min_age_days"] = v
         if "require_trusted_age" in ov:
-            v = check_flag(ov["require_trusted_age"], where)
+            v = check_flag(ov["require_trusted_age"], "require_trusted_age", where)
             if v is not None:
                 entry["require_trusted_age"] = v
+        if "fallback" in ov:
+            v = check_flag(ov["fallback"], "fallback", where)
+            if v is not None:
+                entry["fallback"] = v
         overrides.append((normalized, entry))
 
     # Most-specific prefix wins, independent of file order
@@ -495,15 +646,16 @@ def normalize_policy(lockdata):
 
 
 def effective_policy(action, policy):
-    """(min_age_days, require_trusted_age) for one action reference,
-    applying the most specific matching override."""
+    """(min_age_days, require_trusted_age, fallback) for one action
+    reference, applying the most specific matching override."""
     for prefix, ov in policy["overrides"]:
         if (action + "/").startswith(prefix):
             return (
                 ov.get("min_age_days", policy["min_age_days"]),
                 ov.get("require_trusted_age", policy["require_trusted_age"]),
+                ov.get("fallback", policy["fallback"]),
             )
-    return policy["min_age_days"], policy["require_trusted_age"]
+    return policy["min_age_days"], policy["require_trusted_age"], policy["fallback"]
 
 
 def owner_repo_of(action):
@@ -581,6 +733,7 @@ def cmd_lock(args, repo_root):
     min_age_cli = getattr(args, "min_age_days", None)
     updated = 0
     failed = 0
+    refused = 0
 
     for action_ref, locations in sorted(actions.items()):
         action, ref = action_ref.rsplit("@", 1)
@@ -593,43 +746,71 @@ def cmd_lock(args, repo_root):
                 print(f"  {action_ref} -> {existing['resolved'][:12]} (already locked)")
                 continue
 
+        # A SHA ref already covered by another entry (typically the tag-keyed
+        # entry that `rewrite` pinned it from) must not spawn a duplicate —
+        # otherwise every lock-after-rewrite doubles the lockfile with
+        # tagless, update-untrackable entries. Applies even under --force:
+        # force re-resolves refs; the covering entry is the one to force.
+        if is_sha(ref):
+            covered_by = next(
+                (
+                    key for key, e in lockdata["locked"].items()
+                    if key != action_ref
+                    and e["repo"] == action
+                    and e["resolved"] == ref
+                ),
+                None,
+            )
+            if covered_by:
+                print(f"  {action_ref[:60]}... (covered by {covered_by})"
+                      if len(action_ref) > 63 else
+                      f"  {action_ref} (covered by {covered_by})")
+                continue
+
         print(f"  Resolving {action_ref}...", end=" ", flush=True)
 
         sha = resolve_ref_to_sha(or_key, ref, token)
         if not sha:
-            print("FAILED (could not resolve)")
+            print(red("FAILED (could not resolve)"))
             failed += 1
             continue
 
         # Age floor: quarantine fresh 3rd-party commits (see MIN_COMMIT_AGE_DAYS).
-        # Trusted prefixes (internal actions) are exempt.
+        # Trusted prefixes (internal actions) are exempt. Instead of refusing
+        # a fresh target outright, hold back to the newest release in the
+        # same series that clears the floor — a quarantine that fails CI
+        # just trains everyone to reach for --allow-fresh.
+        selected_tag = None
         if not allow_fresh and not is_trusted(action, trusted_prefixes):
-            eff_min, eff_require = effective_policy(action, policy)
+            eff_min, eff_require, eff_fallback = effective_policy(action, policy)
             min_age = min_age_cli if min_age_cli is not None else eff_min
-            tag_name = ref if not is_sha(ref) else None
-            age, age_source, age_trusted = ref_age_days(or_key, sha, tag_name, token)
-            if age is None:
-                print(
-                    f"FAILED (could not determine commit age for {sha[:12]}; "
-                    f"use --allow-fresh to skip the age check)"
-                )
+            fallback_on = eff_fallback and not getattr(args, "no_fallback", False)
+            pick = select_aged_target(
+                or_key, ref, sha, min_age, eff_require, fallback_on, token
+            )
+            if not pick["ok"]:
+                if pick["reason"] == "unknown":
+                    print(red(
+                        f"FAILED (could not determine commit age for {sha[:12]}; "
+                        f"use --allow-fresh to skip the age check)"
+                    ))
+                else:
+                    newest = (
+                        f"newest is {pick['newest_age']:.1f}d old by {pick['newest_source']}"
+                        if pick["newest_age"] is not None else "ages undeterminable"
+                    )
+                    print(yellow(
+                        f"REFUSED (nothing in the `{ref}` series clears the "
+                        f"{min_age}-day age floor"
+                        f"{' with a trusted age source' if eff_require else ''}; "
+                        f"{newest}; use --allow-fresh to override)"
+                    ))
+                    refused += 1
                 failed += 1
                 continue
-            if eff_require and not age_trusted:
-                print(
-                    f"REFUSED ({sha[:12]} age comes from {age_source} — policy "
-                    f"requires a trusted source (immutable release or merged PR); "
-                    f"vendor + review then --allow-fresh, or fix upstream)"
-                )
-                failed += 1
-                continue
-            if age < min_age:
-                print(
-                    f"REFUSED ({sha[:12]} is {age:.1f} days old by {age_source}, "
-                    f"below the {min_age}-day age floor; use --allow-fresh to override)"
-                )
-                failed += 1
-                continue
+            if pick["held"]:
+                sha = pick["sha"]
+                selected_tag = pick["tag"]
 
         new_entry = {
             "resolved": sha,
@@ -638,17 +819,65 @@ def cmd_lock(args, repo_root):
             "locked_at": datetime.now(timezone.utc).isoformat(),
             "locations": [{"file": f, "line": l} for f, l in locations],
         }
+        if selected_tag:
+            # The tracked channel stays `tag` (so update keeps riding it);
+            # `selected` records the series release actually locked.
+            new_entry["selected"] = selected_tag
         # A re-lock that resolves to the same SHA doesn't invalidate the
         # vendored content — carry the integrity hash forward.
         prev = lockdata["locked"].get(action_ref)
         if prev and prev.get("resolved") == sha and prev.get("integrity"):
             new_entry["integrity"] = prev["integrity"]
         lockdata["locked"][action_ref] = new_entry
-        print(f"{sha[:12]}")
+        if selected_tag:
+            newest_desc = (
+                f"{pick['newest_age']:.1f}d old"
+                if pick["newest_age"] is not None else "of unknown age"
+            )
+            print(
+                green(sha[:12])
+                + yellow(
+                    f"  (held back to {selected_tag}: `{ref}` target is "
+                    f"{newest_desc}, floor is {min_age}d)"
+                )
+            )
+        else:
+            print(green(sha[:12]))
         updated += 1
+
+    # Refresh provenance breadcrumbs. `locations` are documentation, not
+    # identity — verify re-parses workflows fresh and never reads them —
+    # but stale line numbers lie to humans, so every lock re-derives them:
+    # an entry's locations are wherever its own ref OR its resolved SHA
+    # appears now (post-`rewrite`, that's the pinned lines).
+    refreshed = 0
+    for key, e in lockdata["locked"].items():
+        key_ref = key.rsplit("@", 1)[1]
+        locs = []
+        for aref, alocs in actions.items():
+            a, r = aref.rsplit("@", 1)
+            if a == e["repo"] and r in (key_ref, e["resolved"]):
+                for f, l in alocs:
+                    loc = {"file": f, "line": l}
+                    if loc not in locs:
+                        locs.append(loc)
+        # An entry absent from workflows keeps its last-known locations
+        # (verify already warns STALE for those).
+        if locs and e.get("locations") != locs:
+            e["locations"] = locs
+            refreshed += 1
+    if refreshed:
+        print(f"  (refreshed usage locations for {refreshed} entries)")
 
     save_lockfile(repo_root, lockdata)
     print(f"\nLocked {updated} actions ({failed} failed, {len(lockdata['locked']) - updated} unchanged)")
+    if refused:
+        print(yellow(
+            "hint: REFUSED is the quarantine working — nothing in that release\n"
+            "series has aged past the floor yet. Options: wait it out, review\n"
+            "the commit and re-run with --allow-fresh, or add a lockfile policy\n"
+            "override for that prefix (see README: Policy)."
+        ))
     if failed:
         # A partial lock must not look like success in CI.
         sys.exit(1)
@@ -761,19 +990,19 @@ def cmd_verify(args, repo_root):
 
     # Report
     if warnings:
-        print("Warnings:")
+        print(yellow("Warnings:"))
         for w in warnings:
-            print(f"  {w}")
+            print(yellow(f"  {w}"))
         print()
 
     if errors:
-        print("Errors:")
+        print(red("Errors:"))
         for e in errors:
-            print(f"  {e}")
-        print(f"\n{len(errors)} error(s) found.")
+            print(red(f"  {e}"))
+        print(red(f"\n{len(errors)} error(s) found."))
         sys.exit(1)
     else:
-        print(f"All {len(actions)} action references verified.")
+        print(green(f"All {len(actions)} action references verified."))
         sys.exit(0)
 
 
@@ -825,7 +1054,7 @@ def cmd_vendor(args, repo_root):
                     capture_output=True, timeout=60
                 )
                 if result.returncode != 0 or not os.path.exists(archive_path) or os.path.getsize(archive_path) < 100:
-                    print("FAILED (download)")
+                    print(red("FAILED (download)"))
                     failed += 1
                     continue
 
@@ -835,7 +1064,7 @@ def cmd_vendor(args, repo_root):
                     capture_output=True, timeout=30
                 )
                 if result.returncode != 0:
-                    print("FAILED (extract)")
+                    print(red("FAILED (extract)"))
                     failed += 1
                     continue
 
@@ -843,7 +1072,7 @@ def cmd_vendor(args, repo_root):
                 extracted = [d for d in Path(tmpdir).iterdir()
                            if d.is_dir()]
                 if not extracted:
-                    print("FAILED (no content)")
+                    print(red("FAILED (no content)"))
                     failed += 1
                     continue
 
@@ -851,7 +1080,7 @@ def cmd_vendor(args, repo_root):
                 if subpath:
                     source = source / subpath
                     if not source.exists():
-                        print(f"FAILED (subpath {subpath} not found)")
+                        print(red(f"FAILED (subpath {subpath} not found)"))
                         failed += 1
                         continue
 
@@ -878,13 +1107,13 @@ def cmd_vendor(args, repo_root):
                     json.dump(meta, f, indent=2)
                     f.write("\n")
 
-                print(f"OK ({integrity[:19]}...)")
+                print(green(f"OK ({integrity[:19]}...)"))
                 vendored += 1
 
         except (subprocess.TimeoutExpired, OSError) as e:
             # Expected I/O failures (network timeout, disk, permissions).
             # Anything else is a bug and should surface, not be swallowed.
-            print(f"FAILED ({e})")
+            print(red(f"FAILED ({e})"))
             failed += 1
             continue
 
@@ -922,14 +1151,14 @@ def cmd_update(args, repo_root):
 
         new_sha = resolve_ref_to_sha(or_key, tag, token)
         if not new_sha:
-            print("UNAVAILABLE (repo may be gone!)")
+            print(red("UNAVAILABLE (repo may be gone!)"))
             updates.append({"action": action, "status": "unavailable", "ref": action_ref})
             continue
 
         if new_sha == current_sha:
-            print("up to date")
+            print(green("up to date"))
         else:
-            print(f"UPDATE AVAILABLE ({current_sha[:12]} -> {new_sha[:12]})")
+            print(yellow(f"UPDATE AVAILABLE ({current_sha[:12]} -> {new_sha[:12]})"))
             updates.append({
                 "action": action,
                 "status": "outdated",
@@ -981,41 +1210,63 @@ def cmd_update(args, repo_root):
             applied = 0
             revendor_needed = False
             for u in outdated:
-                # Same age floor as `lock`: don't move a pin onto a fresh
-                # 3rd-party commit.
+                # Same age floor as `lock`, same hold-back: don't move a pin
+                # onto a fresh 3rd-party commit; ride the newest release in
+                # the series that clears the floor instead.
+                target_sha, held_note = u["latest"], None
+                selected_tag = None
                 if not allow_fresh and not is_trusted(u["action"], trusted_prefixes):
-                    eff_min, eff_require = effective_policy(u["action"], policy)
+                    eff_min, eff_require, eff_fallback = effective_policy(u["action"], policy)
                     min_age = min_age_cli if min_age_cli is not None else eff_min
-                    age, age_source, age_trusted = ref_age_days(
-                        owner_repo_of(u["action"]), u["latest"], u.get("tag"), token
+                    fallback_on = eff_fallback and not getattr(args, "no_fallback", False)
+                    pick = select_aged_target(
+                        owner_repo_of(u["action"]), u["tag"], u["latest"],
+                        min_age, eff_require, fallback_on, token,
                     )
-                    if eff_require and age is not None and not age_trusted:
-                        print(
-                            f"  SKIPPED {u['action']}: age source is {age_source} — "
-                            f"policy requires a trusted source (immutable release "
-                            f"or merged PR); --allow-fresh to override"
+                    if not pick["ok"]:
+                        newest = (
+                            f"{pick['newest_age']:.1f} days old by {pick['newest_source']}"
+                            if pick["newest_age"] is not None else "of unknown age"
                         )
+                        print(yellow(
+                            f"  SKIPPED {u['action']}: nothing in the `{u['tag']}` series "
+                            f"clears the {min_age}-day age floor (newest is {newest}; "
+                            f"--allow-fresh to override)"
+                        ))
                         continue
-                    if age is None or age < min_age:
-                        age_desc = (
-                            f"{age:.1f} days old by {age_source}"
-                            if age is not None else "of unknown age"
-                        )
-                        print(
-                            f"  SKIPPED {u['action']}: {u['latest'][:12]} is {age_desc} "
-                            f"(below {min_age}-day age floor; --allow-fresh to override)"
-                        )
+                    target_sha = pick["sha"]
+                    newest_desc = (
+                        f"{pick['newest_age']:.1f}d old"
+                        if pick["newest_age"] is not None else "of unknown age"
+                    )
+                    if pick["sha"] == u["current"]:
+                        print(yellow(
+                            f"  HELD {u['action']}: already at the newest release "
+                            f"clearing the {min_age}-day floor "
+                            f"(`{u['tag']}` target is {newest_desc})"
+                        ))
                         continue
+                    if pick["held"]:
+                        selected_tag = pick["tag"]
+                        held_note = (
+                            f" (held back to {pick['tag']}: `{u['tag']}` target is "
+                            f"{newest_desc})"
+                        )
                 entry = lockdata["locked"][u["ref"]]
-                entry["resolved"] = u["latest"]
+                entry["resolved"] = target_sha
                 entry["locked_at"] = datetime.now(timezone.utc).isoformat()
+                if selected_tag:
+                    entry["selected"] = selected_tag
+                else:
+                    entry.pop("selected", None)
                 # The recorded integrity belongs to the OLD sha's content.
                 # (Only for entries actually applied — a SKIPPED action keeps
                 # its pin AND its integrity hash.)
                 if entry.get("integrity"):
                     entry["integrity"] = None
                     revendor_needed = True
-                print(f"  Updated {u['action']} -> {u['latest'][:12]}")
+                print(green(f"  Updated {u['action']} -> {target_sha[:12]}")
+                      + (yellow(held_note) if held_note else ""))
                 applied += 1
             if applied:
                 save_lockfile(repo_root, lockdata)
@@ -1038,12 +1289,14 @@ def cmd_rewrite(args, repo_root):
         print("No lockfile found. Run `action-locker lock` first.", file=sys.stderr)
         sys.exit(1)
 
-    # Build a lookup: action@mutable_ref -> sha
+    # Build a lookup: action@mutable_ref -> sha. The pinned comment shows
+    # `selected` when the entry was held back — the comment tells the truth
+    # about what you actually got (and it's what Dependabot reads).
     ref_map = {}
     for action_ref, entry in lockdata["locked"].items():
         action, ref = action_ref.rsplit("@", 1)
         if not is_sha(ref):
-            ref_map[(action, ref)] = (entry["resolved"], ref)
+            ref_map[(action, ref)] = (entry["resolved"], entry.get("selected") or ref)
 
     if not ref_map:
         print("No mutable refs to rewrite (everything is already pinned).")
@@ -1099,6 +1352,10 @@ def main():
         "--allow-fresh", action="store_true",
         help="Skip the commit age floor (use only when you've reviewed the commit)",
     )
+    lock_parser.add_argument(
+        "--no-fallback", action="store_true",
+        help="Never hold back to an older release; refuse fresh targets outright",
+    )
 
     # verify
     subparsers.add_parser("verify", help="Check that all workflow refs match the lockfile")
@@ -1118,6 +1375,10 @@ def main():
     update_parser.add_argument(
         "--allow-fresh", action="store_true",
         help="Skip the commit age floor (use only when you've reviewed the commit)",
+    )
+    update_parser.add_argument(
+        "--no-fallback", action="store_true",
+        help="Never hold back to an older release; refuse fresh targets outright",
     )
 
     # rewrite

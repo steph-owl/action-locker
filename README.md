@@ -4,7 +4,7 @@ A **lockfile** for your GitHub Actions and a **locker** for the ones you
 can't afford to lose. Pin, verify, and vendor, so your CI survives both
 supply chain attacks and upstream disappearance.
 
-![demo](demo/action-locker.gif)
+![adopt an unpinned repo in three commands](gifs/adopt.gif)
 
 ## The problem
 
@@ -54,6 +54,13 @@ the SHA, the tag it came from, when it was locked, and where it's used:
 }
 ```
 
+A note on `locations`: they're provenance for humans, **not identity**.
+Verification is content-based — `verify` re-parses your workflows fresh
+every run and matches on (action, resolved SHA), so inserting lines,
+reordering steps, or reformatting YAML can never confuse it. Each `lock`
+re-derives the breadcrumbs so they stay truthful after edits and after
+`rewrite`.
+
 ### 2. Rewrite (`action-locker rewrite`)
 
 Rewrites your workflow files to use the pinned SHAs, keeping the human-readable
@@ -96,6 +103,8 @@ no network, no tokens), so it's fast and adds no rate-limit concerns:
 - No unexplained directories in the vendor tree
 - Warns on stale lockfile entries and un-hashed vendored copies
 
+![tampering with a vendored file fails the build](gifs/protect.gif)
+
 ### 5. Update (`action-locker update [--apply]`)
 
 Checks upstream for new releases of everything in the lockfile. Nothing
@@ -112,21 +121,42 @@ tells you an action vanished *while you still have a vendored copy*.
 
 ## Commit age floor (supply-chain quarantine)
 
-`lock` and `update --apply` refuse to pin a 3rd-party action to a commit
-less than **5 days old**. Supply chain attacks on popular actions are
-usually caught within days of the malicious commit landing — a brief
-quarantine keeps you out of the blast window. (The tj-actions compromise
-was public for well under a day before detection; a floor like this means
-`update --apply` that week would have said SKIPPED, not Updated.)
+`lock` and `update --apply` won't pin a 3rd-party action to a commit less
+than **5 days old**. Supply chain attacks on popular actions are usually
+caught within days of the malicious commit landing — a brief quarantine
+keeps you out of the blast window. (The tj-actions compromise was public
+for well under a day before detection.)
+
+But a quarantine that fails your build just trains everyone to reach for
+the override — so instead of refusing, action-locker **holds back**: when
+a tag's current target is too fresh, it walks the same release series
+(`v4` → `v4.3.0`, `v4.2.1`, …) and locks the newest release that clears
+the floor. CI stays green; you permanently ride N days behind the edge;
+`update` slides the window forward as releases age past it. The lockfile
+records the truth — the tracked channel stays in `tag`, the release you
+actually got lands in `selected`, and `rewrite` puts it in the pinned
+comment:
+
+```yaml
+- uses: aws-actions/configure-aws-credentials@<sha>  # v4.3.0
+```
+
+REFUSED still exists — it now means *nothing in that series has aged past
+the floor* (brand-new repos, or a floor cranked high), which is rare and
+worth a human look. That's a quarantine you never learn to bypass.
 
 - Set the window in the lockfile `policy` block (per-prefix overrides
   supported — see **Policy** below), tune per-invocation with
   `--min-age-days N`, or bypass with `--allow-fresh` (only after actually
   reviewing the commit).
-- If the commit date can't be determined (API unreachable, rate-limited),
+- Disable hold-back with `--no-fallback` or `"fallback": false` in policy
+  if you'd rather see refusals than ride behind.
+- If no candidate's age can be determined (API unreachable, rate-limited),
   it **fails closed** rather than pinning blind — set `GITHUB_TOKEN` for
-  busy repos, since the age lookup uses the GitHub API.
-- Actions matched by `trusted_prefixes` are exempt.
+  busy repos, since age lookups use the GitHub API.
+- Actions matched by `trusted_prefixes` are exempt. Exact-version refs
+  (`@v4.3.1`) are never substituted — you named a version, you get it or
+  a refusal.
 
 **Where the date comes from (trust ladder):**
 
@@ -148,6 +178,8 @@ A *mutable* release's `published_at` is deliberately ignored: the tag can
 move after publication (that's exactly the tj-actions attack). And commit
 *signatures* don't help here either — the signature covers the
 attacker-chosen date; it proves who, not when.
+
+![the quarantine refusing fresh commits, ladder rungs named](gifs/quarantine.gif)
 
 ## What it protects against — and what it doesn't
 
@@ -264,7 +296,10 @@ in a PR diff. The lockfile is reviewed, diffable, and CODEOWNERS-able.
 - `require_trusted_age` — refuse the committer-date rung of the ladder:
   only immutable-release or merged-PR dates are accepted. Upstreams that
   provide neither can still be adopted deliberately: vendor + review, then
-  `--allow-fresh`.
+  `--allow-fresh`. (Hold-back respects this too: it skips candidates whose
+  age isn't server-attested.)
+- `fallback` — set `false` to disable hold-back (see the age floor
+  section) and get hard refusals instead.
 - `overrides` — per-prefix exceptions; the most specific matching prefix
   wins, regardless of order. Same owner-boundary rules as
   `trusted_prefixes` (`steph-owl/` can never match `steph-owl-evil/x`).
