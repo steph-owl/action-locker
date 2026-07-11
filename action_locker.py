@@ -1404,7 +1404,338 @@ class LegacyRegexBackend(WorkflowParserBackend):
         )
 
 
+# The exact ruamel.yaml release the `stable` backend is developed and
+# tested against. It is an OPTIONAL dependency today (install with the
+# `stable` extra); the default lock/verify/rewrite path stays stdlib-only,
+# so a plain `pip install action-locker` still arrives with no supply
+# chain of its own. ADR 0001 PR 5 will vendor + hash this exact closure so
+# `stable` can become the production default without an ambient install.
+STABLE_RUAMEL_PIN = "0.19.1"
+
+# Refuse to parse a workflow larger than this (bytes). Real workflows are a
+# few KiB; anything past this is pathological and gets a fail-closed
+# YAML_PARSE_ERROR before ruamel is handed the input.
+STABLE_MAX_BYTES = 5 * 1024 * 1024
+
+
+# Distinct "no bad key" sentinel: a null YAML key is itself `None`, so None
+# cannot double as "all keys are strings".
+_ALL_KEYS_STRING = object()
+
+
+def _stable_nonstring_key(mapping):
+    """First key of `mapping` that is not a plain string, else the
+    `_ALL_KEYS_STRING` sentinel.
+
+    ruamel round-trip construction can yield keys that are NOT `str`
+    instances: a tagged scalar (`!!str uses`), or an int/bool/null key.
+    Such a key can carry the executable name `uses`/`jobs`/`steps` while
+    silently failing an `in`/`[]` lookup — the exact fail-open a name-based
+    walk must guard against. Every mapping on the path to a `uses` is
+    checked; any non-string key fails the scan closed. Quoted string keys
+    are ordinary `str` subclasses and pass. The sentinel (not `None`) marks
+    success, because a null key legitimately IS `None`.
+    """
+    for key in mapping:
+        if not isinstance(key, str):
+            return key
+    return _ALL_KEYS_STRING
+
+
+def _stable_pos(container, key, want_value=True):
+    """1-based (line, column) for `key` (or its value) in a ruamel node.
+
+    ruamel stores 0-based positions in `node.lc.data[key]` as
+    `[key_line, key_col, value_line, value_col]`. Returns (None, None) when
+    location metadata is unavailable — positions are diagnostics, never
+    identity, so their absence must not change classification.
+    """
+    lc = getattr(container, "lc", None)
+    data = getattr(lc, "data", None) if lc is not None else None
+    try:
+        entry = data[key]
+    except (TypeError, KeyError, IndexError):
+        return None, None
+    if want_value and len(entry) >= 4:
+        return entry[2] + 1, entry[3] + 1
+    if len(entry) >= 2:
+        return entry[0] + 1, entry[1] + 1
+    return None, None
+
+
+class StructuralYamlBackend(WorkflowParserBackend):
+    """`stable`: a structural YAML backend built on ruamel.yaml in YAML 1.2
+    round-trip mode.
+
+    Unlike lab/0's line scanner, this parses the real document tree, so it
+    correctly handles anchors/aliases, quoting, flow collections, and
+    multi-line scalars that lab/0 deliberately refuses. It walks ONLY the
+    two executable `uses` slots — jobs.<id>.uses and
+    jobs.<id>.steps[<i>].uses — and reports structural problems as typed
+    diagnostics.
+
+    Fail-closed contract (shared by every backend): a malformed container
+    ON THE PATH to a possible `uses` (root/jobs/job/steps/step of the wrong
+    type, a non-string `uses`, duplicate keys, multiple documents, or any
+    YAML error) yields accepted=False, never a silent empty scan. Round-trip
+    mode never constructs arbitrary Python objects, so a `!!python/...` tag
+    is preserved as a non-string node and fails closed on the `uses` path
+    rather than executing.
+
+    This backend does not rewrite and does no I/O beyond reading the one
+    file it is given. It is not yet the production default (ADR 0001).
+    """
+
+    name = "stable"
+
+    def _loader(self):
+        """A fresh YAML 1.2 round-trip loader, configured to fail closed:
+        duplicate keys raise, and no unsafe Python object construction."""
+        from ruamel.yaml import YAML
+        yaml = YAML(typ="rt")
+        yaml.version = (1, 2)
+        yaml.allow_duplicate_keys = False
+        yaml.preserve_quotes = True
+        return yaml
+
+    def parse_file(self, repo_root, path):
+        """Parse one workflow file into a ParseResult. Reads bytes from the
+        given path only; any parse failure fails closed with a diagnostic."""
+        from ruamel.yaml.error import YAMLError
+        from ruamel.yaml.constructor import DuplicateKeyError
+
+        path = Path(path)
+        repo_root = Path(repo_root)
+        try:
+            rel = path.resolve().relative_to(repo_root.resolve()).as_posix()
+        except ValueError:
+            rel = path.as_posix()
+
+        references = []
+        diagnostics = []
+        state = {"accepted": True}
+
+        def diag(code, message, severity="error", line=None, column=None):
+            diagnostics.append(
+                ParseDiagnostic(rel, code, message, severity, line, column)
+            )
+            if severity == "error":
+                state["accepted"] = False
+
+        try:
+            raw = path.read_bytes()
+        except OSError as exc:
+            diag("YAML_PARSE_ERROR",
+                 f"cannot read workflow: {exc.__class__.__name__}")
+            return ParseResult(self.name, (), tuple(diagnostics), False)
+        if raw.startswith(b"\xef\xbb\xbf"):
+            raw = raw[3:]
+
+        # An explicit input ceiling before parsing (IMPLEMENTATION.md
+        # performance envelope). A workflow larger than this is already
+        # pathological; refuse it rather than hand ruamel a memory bomb.
+        if len(raw) > STABLE_MAX_BYTES:
+            diag("YAML_PARSE_ERROR",
+                 f"workflow exceeds the {STABLE_MAX_BYTES}-byte scan limit")
+            return ParseResult(self.name, (), tuple(diagnostics), False)
+
+        yaml = self._loader()
+        try:
+            documents = list(yaml.load_all(raw.decode("utf-8")))
+        except DuplicateKeyError as exc:
+            line, col = _yaml_error_pos(exc)
+            diag("DUPLICATE_KEY",
+                 "duplicate mapping key (GitHub rejects the workflow)",
+                 line=line, column=col)
+            return ParseResult(self.name, (), tuple(diagnostics), False)
+        except (YAMLError, UnicodeDecodeError) as exc:
+            line, col = _yaml_error_pos(exc)
+            diag("YAML_PARSE_ERROR",
+                 f"invalid YAML: {exc.__class__.__name__}",
+                 line=line, column=col)
+            return ParseResult(self.name, (), tuple(diagnostics), False)
+        except RecursionError:
+            # Deeply nested collections exhaust the interpreter stack.
+            # RecursionError is a RuntimeError, not a YAMLError — catch it
+            # so a ~1 KB nesting bomb fails THIS file closed instead of
+            # aborting the whole scan with an uncaught traceback.
+            diag("YAML_PARSE_ERROR", "input nesting too deep to parse safely")
+            return ParseResult(self.name, (), tuple(diagnostics), False)
+        except Exception as exc:
+            # ruamel's constructors can raise bare builtin exceptions
+            # (ValueError, KeyError, AssertionError, ...) on adversarial
+            # tags and directives — none are YAMLError subclasses. A parser
+            # over untrusted input must convert ANY parse-time failure into
+            # a fail-closed result, never a crash that skips sibling files.
+            diag("YAML_PARSE_ERROR",
+                 f"parser raised {exc.__class__.__name__}")
+            return ParseResult(self.name, (), tuple(diagnostics), False)
+
+        if len(documents) > 1:
+            diag("MULTIPLE_DOCUMENTS",
+                 f"{len(documents)} YAML documents; a workflow must be exactly one")
+            return ParseResult(self.name, (), tuple(diagnostics), False)
+
+        root = documents[0] if documents else None
+        if root is None:
+            # An empty document has no jobs and therefore no `uses` to miss.
+            return ParseResult(self.name, (), tuple(diagnostics), True)
+
+        _stable_walk(rel, root, references, diag)
+        return ParseResult(
+            backend=self.name,
+            references=tuple(sorted(references)),
+            diagnostics=tuple(diagnostics),
+            accepted=state["accepted"],
+        )
+
+
+def _yaml_error_pos(exc):
+    """1-based (line, column) from a ruamel error's problem_mark, or
+    (None, None)."""
+    mark = getattr(exc, "problem_mark", None) or getattr(exc, "context_mark", None)
+    if mark is None:
+        return None, None
+    return mark.line + 1, mark.column + 1
+
+
+def _stable_walk(rel, root, references, diag):
+    """Visit the two executable `uses` slots in a parsed workflow tree.
+
+    Only jobs.<id>.uses and jobs.<id>.steps[<i>].uses are inspected. A node
+    of the WRONG type on that path (root/jobs/job/steps/step) fails closed
+    with its specific diagnostic; a benign empty (`None`) node simply has no
+    `uses` to find. A NON-STRING key anywhere on the path also fails closed:
+    a tagged or typed key can spell `uses` while dodging a name lookup.
+    Unrelated malformed job fields are ignored — actionlint territory — but
+    nothing on the path to a possible `uses` is trusted blindly.
+    """
+    if not isinstance(root, dict):
+        diag("ROOT_NOT_MAPPING", "workflow root is not a mapping")
+        return
+    bad = _stable_nonstring_key(root)
+    if bad is not _ALL_KEYS_STRING:
+        diag("NON_STRING_KEY",
+             f"top-level key `{bad!r}` is not a plain string")
+        return
+    if "jobs" not in root:
+        return  # a document with no `jobs:` has nothing lockable
+    jobs = root["jobs"]
+    if jobs is None:
+        return
+    if not isinstance(jobs, dict):
+        line, col = _stable_pos(root, "jobs")
+        diag("JOBS_NOT_MAPPING", "`jobs` is not a mapping", line=line, column=col)
+        return
+    bad = _stable_nonstring_key(jobs)
+    if bad is not _ALL_KEYS_STRING:
+        line, col = _stable_pos(root, "jobs")
+        diag("NON_STRING_KEY", f"job id `{bad!r}` is not a plain string",
+             line=line, column=col)
+        return
+
+    for job_id, job in jobs.items():
+        if job is None:
+            continue
+        if not isinstance(job, dict):
+            line, col = _stable_pos(jobs, job_id)
+            diag("JOB_NOT_MAPPING", f"job `{job_id}` is not a mapping",
+                 line=line, column=col)
+            continue
+        bad = _stable_nonstring_key(job)
+        if bad is not _ALL_KEYS_STRING:
+            line, col = _stable_pos(jobs, job_id)
+            diag("NON_STRING_KEY",
+                 f"key `{bad!r}` in job `{job_id}` is not a plain string",
+                 line=line, column=col)
+            continue
+
+        if "uses" in job:
+            line, col = _stable_pos(job, "uses")
+            _stable_emit(rel, f"jobs.{job_id}.uses", job["uses"], True,
+                         line, col, references, diag)
+
+        if "steps" in job and job["steps"] is not None:
+            steps = job["steps"]
+            if not isinstance(steps, list):
+                line, col = _stable_pos(job, "steps")
+                diag("STEPS_NOT_SEQUENCE", f"`steps` of job `{job_id}` is not a sequence",
+                     line=line, column=col)
+                continue
+            for idx, step in enumerate(steps):
+                if step is None:
+                    continue
+                if not isinstance(step, dict):
+                    line, col = _stable_pos(steps, idx)
+                    diag("STEP_NOT_MAPPING",
+                         f"jobs.{job_id}.steps[{idx}] is not a mapping",
+                         line=line, column=col)
+                    continue
+                bad = _stable_nonstring_key(step)
+                if bad is not _ALL_KEYS_STRING:
+                    line, col = _stable_pos(steps, idx)
+                    diag("NON_STRING_KEY",
+                         f"key `{bad!r}` in jobs.{job_id}.steps[{idx}] "
+                         "is not a plain string", line=line, column=col)
+                    continue
+                if "uses" in step:
+                    line, col = _stable_pos(step, "uses")
+                    _stable_emit(
+                        rel, f"jobs.{job_id}.steps[{idx}].uses", step["uses"],
+                        False, line, col, references, diag)
+
+    # Field invariant: a semantic path identifies ONE `uses` slot. Distinct
+    # string job ids and positional step indices can't collide, and ruamel
+    # rejects duplicate keys outright — but assert it rather than assume it.
+    seen = set()
+    for r in references:
+        if r.semantic_path in seen:
+            diag("DUPLICATE_PATH",
+                 f"semantic path {r.semantic_path} emitted more than once")
+        seen.add(r.semantic_path)
+
+
+def _stable_emit(rel, path, value, job_level, line, col, references, diag):
+    """Classify one `uses` value into a WorkflowReference, or fail closed.
+
+    A non-string value (null, number, sequence, mapping, or an unconstructed
+    `!!python/...` tag) means the `uses` slot exists but holds no
+    interpretable reference — USES_NOT_STRING, accepted=False. An
+    unsplittable target (`INVALID_USES_TARGET`) is a warning: the structure
+    was clear, only the value is off, and mutability/validity is policy's
+    call, not the parser's.
+    """
+    if not isinstance(value, str):
+        diag("USES_NOT_STRING",
+             f"{path} is not a string scalar", line=line, column=col)
+        return
+    scalar = str(value)
+    kind, action, ref, problem = classify_uses_target(scalar, job_level)
+    if problem:
+        diag("INVALID_USES_TARGET", f"`{scalar}`: {problem}",
+             severity="warning", line=line, column=col)
+    references.append(WorkflowReference(
+        file=rel, semantic_path=path, kind=kind, raw_target=scalar,
+        action=action, ref=ref, line=line or 0, column=col or 0,
+    ))
+
+
 PARSER_BACKENDS = {"lab": LegacyRegexBackend}
+
+
+def stable_backend_available():
+    """True when ruamel.yaml is importable, so the `stable` backend can run.
+
+    The import is lazy and its failure is reported as `backend unavailable`
+    (scan exit code 4), never a crash and never a silent fall back to
+    another backend — a security scanner must not quietly answer with a
+    different engine than the one requested.
+    """
+    try:
+        import ruamel.yaml  # noqa: F401
+    except ImportError:
+        return False
+    return True
 
 
 def _reference_as_json(ref):
@@ -2085,15 +2416,30 @@ def cmd_scan(args, repo_root):
             file=sys.stderr,
         )
         sys.exit(2)
-    if requested not in PARSER_BACKENDS:
+
+    # Resolve the requested backend. `backend unavailable` (exit 4) is
+    # distinct from `rejected` (exit 1): a missing optional dependency must
+    # never make the scanner silently answer with a different engine.
+    if requested == "lab":
+        backend = LegacyRegexBackend()
+    elif requested == "stable":
+        if not stable_backend_available():
+            print(
+                "Error: parser backend `stable` requires ruamel.yaml "
+                f"(pinned {STABLE_RUAMEL_PIN}), which is not installed. "
+                "Install the optional extra: pip install 'action-locker[stable]'",
+                file=sys.stderr,
+            )
+            sys.exit(4)
+        backend = StructuralYamlBackend()
+    else:  # compare
         print(
-            f"Error: parser backend `{requested}` is not implemented yet "
-            f"(see docs/parser-lab/IMPLEMENTATION.md); available: "
-            f"{', '.join(sorted(PARSER_BACKENDS))}",
+            "Error: parser backend `compare` is not implemented yet "
+            "(see docs/parser-lab/IMPLEMENTATION.md); available: lab, stable",
             file=sys.stderr,
         )
         sys.exit(4)
-    backend = PARSER_BACKENDS[requested]()
+
     if not os.environ.get("ACTION_LOCKER_PARSER_LAB_CI"):
         print(
             yellow(

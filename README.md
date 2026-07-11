@@ -281,9 +281,23 @@ rest: multi-line (folded) scalars, flow collections that span lines,
 quoted mapping keys, anchors/aliases/merge keys, tabs, and multiple
 documents all produce `accepted: false` with a diagnostic rather than a
 guess. That's the point — a scanner making a security claim must say "I
-can't read this" instead of silently reporting zero references. The
-forthcoming `stable` backend (ADR 0001, PR 2) reads full YAML; `compare`
-mode will measure exactly where the two disagree.
+can't read this" instead of silently reporting zero references.
+
+The `stable` backend reads full YAML through a pinned `ruamel.yaml` in
+1.2 round-trip mode, so it handles the constructs lab/0 refuses (anchors,
+flow collections, folded scalars) while walking only the two executable
+`uses` slots. It's an **optional** install — the default tool stays
+stdlib-only:
+
+```bash
+pip install 'action-locker[stable]'
+python3 action_locker.py scan --parser stable --format json
+```
+
+Without it, `scan --parser stable` reports the backend as unavailable
+(exit 4) rather than falling back — a scanner must answer with the engine
+you asked for. `compare` mode (running both and diffing their normalized
+results) is the next step in ADR 0001, PR 2.
 
 ## Trusted prefixes
 

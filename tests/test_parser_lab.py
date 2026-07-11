@@ -729,15 +729,14 @@ class TestScanCli:
         assert "external-action" in out
         assert "backend lab/0" in out
 
-    def test_exit_4_for_unavailable_backends(self, owl_repo, capsys):
-        assert run_scan(owl_repo, parser="stable") == 4
+    def test_exit_4_for_compare_backend_not_yet_implemented(self, owl_repo, capsys):
+        # `compare` is the next ADR 0001 step; until then it is a clean
+        # "unavailable" (4), never a crash. (stable's availability depends
+        # on the optional ruamel dep and is covered in test_parser_stable.)
         assert run_scan(owl_repo, parser="compare") == 4
-        err = capsys.readouterr().err
-        assert "not implemented yet" in err
+        assert "not implemented yet" in capsys.readouterr().err
 
     def test_env_var_selects_backend(self, owl_repo, monkeypatch, capsys):
-        monkeypatch.setenv("ACTION_LOCKER_PARSER", "stable")
-        assert run_scan(owl_repo) == 4
         monkeypatch.setenv("ACTION_LOCKER_PARSER", "lab")
         assert run_scan(owl_repo) == 0
         capsys.readouterr()

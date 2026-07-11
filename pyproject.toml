@@ -10,8 +10,18 @@ requires-python = ">=3.9"
 license = { text = "Apache-2.0" }
 
 # Stdlib-only on purpose: this tool runs in CI and pre-commit environments
-# where every dependency is itself a supply-chain surface.
+# where every dependency is itself a supply-chain surface. The production
+# path (lock/verify/rewrite/vendor/update) imports nothing outside the
+# standard library.
 dependencies = []
+
+[project.optional-dependencies]
+# The experimental `stable` parser backend (`scan --parser stable`) is the
+# only code that touches ruamel.yaml, and it imports it lazily — so this is
+# opt-in and never on the production path. Pinned exactly on purpose (a
+# parser is security-relevant); ADR 0001 PR 5 will vendor + hash it so the
+# `stable` path can become the default with no ambient install.
+stable = ["ruamel.yaml==0.19.1"]
 
 [project.scripts]
 action-locker = "action_locker:main"
