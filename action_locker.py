@@ -1738,6 +1738,96 @@ def stable_backend_available():
     return True
 
 
+# Disagreement classes, ordered most-actionable first for display.
+COMPARE_CLASSES = (
+    "TARGET_MISMATCH",
+    "KIND_MISMATCH",
+    "MISSING_REFERENCE",
+    "EXTRA_REFERENCE",
+    "DUPLICATE_PATH",
+    "ACCEPTANCE_MISMATCH",
+)
+
+
+def _normalize_refs(result):
+    """{semantic_path: (kind, raw_target)} for a result, plus the set of
+    paths that appeared more than once.
+
+    Comparison identity is (kind, raw_target) keyed by semantic path —
+    NEVER line/column, which backends legitimately report differently. This
+    is the normalization ADR 0001 specifies so a disagreement means a
+    semantic difference, not a formatting one.
+    """
+    seen = {}
+    dups = set()
+    for r in result.references:
+        if r.semantic_path in seen:
+            dups.add(r.semantic_path)
+        else:
+            seen[r.semantic_path] = (r.kind, r.raw_target)
+    return seen, dups
+
+
+def _compare_file(stable_res, lab_res):
+    """Disagreements between the authoritative `stable` result and `lab`.
+
+    Acceptance is the FIRST gate: a backend that rejected a file has no
+    trustworthy reference map, so an acceptance split is the ONLY thing
+    reported for that file — never a spurious per-path diff against a
+    backend that already said "I can't read this." Only when BOTH accept
+    are references diffed, by semantic path, on (kind, raw_target).
+
+    Each disagreement carries `expected`:
+      - True  — the benign, by-design case: stable reads what lab
+                deliberately fails closed on (anchors, folds, flow). This is
+                the migration's normal state, not a bug.
+      - False — worth a human: lab accepting what the authoritative parser
+                rejects, or the two accepting DIFFERENT references for the
+                same slot (one is confidently wrong — the whole reason
+                compare exists).
+
+    Consistency is not correctness: two backends can agree and both be
+    wrong. `compare` measures agreement; the fuzz-vs-oracle corpus measures
+    truth. The `expected` flag keeps the exit code from training anyone to
+    ignore it (cf. the age-floor hold-back rationale in the README).
+    """
+    dis = []
+    if stable_res.accepted != lab_res.accepted:
+        dis.append({
+            "class": "ACCEPTANCE_MISMATCH",
+            "expected": stable_res.accepted and not lab_res.accepted,
+            "stable_accepted": stable_res.accepted,
+            "lab_accepted": lab_res.accepted,
+        })
+        return dis
+    if not stable_res.accepted:
+        return dis  # both rejected: agreement on "cannot scan safely"
+
+    smap, sdups = _normalize_refs(stable_res)
+    lmap, ldups = _normalize_refs(lab_res)
+    for backend, dups in (("stable", sdups), ("lab", ldups)):
+        for p in sorted(dups):
+            dis.append({"class": "DUPLICATE_PATH", "expected": False,
+                        "semantic_path": p, "backend": backend})
+    for p in sorted(set(smap) | set(lmap)):
+        s, l = smap.get(p), lmap.get(p)
+        if s and not l:
+            dis.append({"class": "MISSING_REFERENCE", "expected": False,
+                        "semantic_path": p, "stable": s[1], "lab": None})
+        elif l and not s:
+            dis.append({"class": "EXTRA_REFERENCE", "expected": False,
+                        "semantic_path": p, "stable": None, "lab": l[1]})
+        elif s[1] != l[1]:
+            dis.append({"class": "TARGET_MISMATCH", "expected": False,
+                        "semantic_path": p, "stable": s[1], "lab": l[1]})
+        elif s[0] != l[0]:
+            dis.append({"class": "KIND_MISMATCH", "expected": False,
+                        "semantic_path": p, "stable": s[0], "lab": l[0]})
+    dis.sort(key=lambda d: (COMPARE_CLASSES.index(d["class"]),
+                            d.get("semantic_path", "")))
+    return dis
+
+
 def _reference_as_json(ref):
     return {
         "semantic_path": ref.semantic_path,
@@ -2417,12 +2507,16 @@ def cmd_scan(args, repo_root):
         )
         sys.exit(2)
 
+    if requested == "compare":
+        _cmd_scan_compare(args, repo_root)  # exits with its own code
+        return
+
     # Resolve the requested backend. `backend unavailable` (exit 4) is
     # distinct from `rejected` (exit 1): a missing optional dependency must
     # never make the scanner silently answer with a different engine.
     if requested == "lab":
         backend = LegacyRegexBackend()
-    elif requested == "stable":
+    else:  # stable
         if not stable_backend_available():
             print(
                 "Error: parser backend `stable` requires ruamel.yaml "
@@ -2432,13 +2526,6 @@ def cmd_scan(args, repo_root):
             )
             sys.exit(4)
         backend = StructuralYamlBackend()
-    else:  # compare
-        print(
-            "Error: parser backend `compare` is not implemented yet "
-            "(see docs/parser-lab/IMPLEMENTATION.md); available: lab, stable",
-            file=sys.stderr,
-        )
-        sys.exit(4)
 
     if not os.environ.get("ACTION_LOCKER_PARSER_LAB_CI"):
         print(
@@ -2507,6 +2594,161 @@ def cmd_scan(args, repo_root):
             print(red(summary + " — rejected file(s) present"))
 
     sys.exit(0 if all_accepted else 1)
+
+
+def _cmd_scan_compare(args, repo_root):
+    """Differential `scan --parser compare`: run lab/0 and stable over the
+    same bytes and diff their normalized results.
+
+    `stable` is authoritative; this measures where the experimental lab
+    agrees with it (ADR 0001). Read-only and offline. Requires ruamel
+    (stable) — missing it is `backend unavailable` (exit 4), never a
+    single-backend fallback.
+
+    Exit codes: 3 = the backends disagreed on some file; 1 = they agreed
+    but the authoritative parser rejected a workflow; 0 = agree and stable
+    accepted everything; 4 = stable unavailable. Exit 3 fires on ANY
+    disagreement (the honest signal); the report separates `expected`
+    subset-gaps from `actionable` ones so a future CI gate can choose its
+    own policy explicitly rather than inheriting a silent one.
+    """
+    if not stable_backend_available():
+        print(
+            "Error: parser backend `compare` requires the `stable` backend, "
+            f"which needs ruamel.yaml (pinned {STABLE_RUAMEL_PIN}). "
+            "Install the optional extra: pip install 'action-locker[stable]'",
+            file=sys.stderr,
+        )
+        sys.exit(4)
+
+    lab = LegacyRegexBackend()
+    stable = StructuralYamlBackend()
+    if not os.environ.get("ACTION_LOCKER_PARSER_LAB_CI"):
+        print(
+            yellow(
+                "note: `compare` runs experimental parser backends "
+                f"(`{lab.name}` vs authoritative `{stable.name}`); production "
+                "commands still use the built-in scanner (ADR 0001). "
+                "Set ACTION_LOCKER_PARSER_LAB_CI=1 to silence."
+            ),
+            file=sys.stderr,
+        )
+
+    workflows_dir = repo_root / ".github" / "workflows"
+    wf_files = []
+    if workflows_dir.is_dir():
+        wf_files = sorted(workflows_dir.glob("*.yml")) + sorted(
+            workflows_dir.glob("*.yaml")
+        )
+
+    files = []
+    for f in sorted(wf_files, key=lambda p: p.relative_to(repo_root).as_posix()):
+        rel = f.relative_to(repo_root).as_posix()
+        s_res = stable.parse_file(repo_root, f)
+        l_res = lab.parse_file(repo_root, f)
+        dis = _compare_file(s_res, l_res)
+        files.append((rel, s_res, l_res, dis))
+
+    any_disagreement = any(dis for _, _, _, dis in files)
+    any_actionable = any(
+        not d["expected"] for _, _, _, dis in files for d in dis
+    )
+    stable_all_accepted = all(s.accepted for _, s, _, _ in files)
+
+    if args.format == "json":
+        payload = {
+            "schema_version": PARSER_LAB_SCHEMA_VERSION,
+            "authoritative_backend": stable.name,
+            "backends": {"stable": stable.name, "lab": lab.name},
+            "agreement": not any_disagreement,
+            "actionable": any_actionable,
+            "files": [
+                {
+                    "path": rel,
+                    "agreement": not dis,
+                    "disagreements": dis,
+                    "stable": {
+                        "accepted": s.accepted,
+                        "references": [_reference_as_json(x) for x in s.references],
+                        "diagnostics": [_diagnostic_as_json(d) for d in s.diagnostics],
+                    },
+                    "lab": {
+                        "accepted": l.accepted,
+                        "references": [_reference_as_json(x) for x in l.references],
+                        "diagnostics": [_diagnostic_as_json(d) for d in l.diagnostics],
+                    },
+                }
+                for rel, s, l, dis in files
+            ],
+        }
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        agree_count = 0
+        for rel, s, l, dis in files:
+            if not dis:
+                agree_count += 1
+                if s.accepted:
+                    print(green(f"{rel}: agree ({len(s.references)} reference(s))"))
+                else:
+                    print(f"{rel}: agree (both rejected)")
+                continue
+            print(red(f"PARSER DISAGREEMENT {rel}"))
+            for d in dis:
+                for line in _format_disagreement_lines(d):
+                    print(line)
+        if not files:
+            print(f"No workflow files found under {workflows_dir}")
+        expected_n = sum(
+            1 for _, _, _, dis in files for d in dis if d["expected"]
+        )
+        actionable_n = sum(
+            1 for _, _, _, dis in files for d in dis if not d["expected"]
+        )
+        disagree_files = sum(1 for _, _, _, dis in files if dis)
+        summary = (
+            f"\n{len(files)} file(s): {agree_count} agree, "
+            f"{disagree_files} disagree "
+            f"({actionable_n} actionable, {expected_n} expected); "
+            f"authoritative: {stable.name}"
+        )
+        if any_actionable:
+            print(red(summary))
+        elif any_disagreement:
+            print(yellow(summary + " — all expected (lab fails closed on its subset)"))
+        else:
+            print(green(summary))
+
+    if any_disagreement:
+        sys.exit(3)
+    sys.exit(0 if stable_all_accepted else 1)
+
+
+def _format_disagreement_lines(d):
+    """Human-readable lines for one disagreement (ADR 0001 observability
+    shape). Workflow content is never printed — only paths, kinds, codes,
+    and `uses` targets — because scripts may embed secrets."""
+    cls = d["class"]
+    mark = " (expected)" if d["expected"] else ""
+    absent = "<absent>"
+    if cls == "ACCEPTANCE_MISMATCH":
+        s = "accepted" if d["stable_accepted"] else "rejected"
+        l = "accepted" if d["lab_accepted"] else "rejected"
+        return [f"  {cls}{mark}  stable={s}  lab={l}"]
+    if cls in ("MISSING_REFERENCE", "EXTRA_REFERENCE", "TARGET_MISMATCH"):
+        return [
+            f"  {cls}{mark} {d['semantic_path']}",
+            f"    stable: {d['stable'] if d['stable'] is not None else absent}",
+            f"    lab:    {d['lab'] if d['lab'] is not None else absent}",
+        ]
+    if cls == "KIND_MISMATCH":
+        return [
+            f"  {cls}{mark} {d['semantic_path']}",
+            f"    stable: {d['stable']}",
+            f"    lab:    {d['lab']}",
+        ]
+    if cls == "DUPLICATE_PATH":
+        return [f"  {cls}{mark} {d['semantic_path']} ({d['backend']})"]
+    return [f"  {cls}{mark}"]
 
 
 # --- CLI ---

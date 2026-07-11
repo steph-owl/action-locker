@@ -296,8 +296,26 @@ python3 action_locker.py scan --parser stable --format json
 
 Without it, `scan --parser stable` reports the backend as unavailable
 (exit 4) rather than falling back — a scanner must answer with the engine
-you asked for. `compare` mode (running both and diffing their normalized
-results) is the next step in ADR 0001, PR 2.
+you asked for.
+
+`compare` mode runs both backends over the same bytes and diffs their
+normalized results — `(kind, raw_target)` keyed by semantic path, never
+line numbers:
+
+```bash
+python3 action_locker.py scan --parser compare --format text
+```
+
+`stable` is authoritative; compare measures where the experimental `lab/0`
+agrees with it. It separates **expected** disagreements (stable reads a
+construct lab deliberately fails closed on — the normal migration state)
+from **actionable** ones (lab accepting what stable rejects, or the two
+reading *different* references for the same slot — a real bug in one
+backend). Exit `3` on any disagreement, `1` if they agree but the
+authoritative parser rejected a workflow, `0` on full agreement. One
+caveat worth stating plainly: compare measures *consistency*, not
+*correctness* — two backends can agree and both be wrong. Agreement is a
+signal, not a proof; the fuzz-vs-oracle corpus is what checks truth.
 
 ## Trusted prefixes
 

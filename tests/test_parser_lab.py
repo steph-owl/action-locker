@@ -729,12 +729,13 @@ class TestScanCli:
         assert "external-action" in out
         assert "backend lab/0" in out
 
-    def test_exit_4_for_compare_backend_not_yet_implemented(self, owl_repo, capsys):
-        # `compare` is the next ADR 0001 step; until then it is a clean
-        # "unavailable" (4), never a crash. (stable's availability depends
-        # on the optional ruamel dep and is covered in test_parser_stable.)
+    def test_compare_without_stable_is_unavailable(self, owl_repo, monkeypatch, capsys):
+        # compare needs the stable backend; without ruamel it is a clean
+        # "unavailable" (4), never a crash or a single-backend fallback.
+        # (compare's full behavior is covered in test_parser_compare.py.)
+        monkeypatch.setattr(action_locker, "stable_backend_available", lambda: False)
         assert run_scan(owl_repo, parser="compare") == 4
-        assert "not implemented yet" in capsys.readouterr().err
+        assert "ruamel.yaml" in capsys.readouterr().err
 
     def test_env_var_selects_backend(self, owl_repo, monkeypatch, capsys):
         monkeypatch.setenv("ACTION_LOCKER_PARSER", "lab")
