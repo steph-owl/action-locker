@@ -1,0 +1,31 @@
+name: Parser Lab Specimen
+
+on:
+  pull_request:
+
+jobs:
+  reusable:
+    uses: "octo-org/example/.github/workflows/test.yml@v2"
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # uses: fake/comment@v1
+      - name: Script containing misleading text
+        run: |
+          echo 'uses: fake/script@v2'
+          cat <<'HEREDOC'
+          - uses: fake/heredoc@v3
+          HEREDOC
+
+      - name: Quoted action
+        uses: 'actions/checkout@v4'
+
+      - name: Plain action
+        uses: actions/setup-python@v5
+
+      - name: Local action
+        uses: ./tools/local-action
+
+      - name: Docker action
+        uses: docker://alpine:3.20

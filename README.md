@@ -260,6 +260,31 @@ python3 action_locker.py verify    # the CI gate (offline)
 python3 action_locker.py update    # check upstream; --apply to accept
 ```
 
+### Experimental: `scan` (the parser lab)
+
+```bash
+python3 action_locker.py scan --parser lab --format json
+```
+
+A read-only, offline structural scan of your workflows: every `uses:` gets
+a semantic path (`jobs.build.steps[2].uses`), a kind (external action,
+reusable workflow, local, docker), and — crucially — anything the scanner
+*can't* confidently classify is reported as a rejection, never silently
+skipped. This is the first piece of the parser-backend work described in
+[ADR 0001](docs/adr/0001-workflow-parser-backends.md): the longtime regex
+scanner is now also an explicit, differential-testable backend (`lab/0`).
+Production `lock`/`verify`/`rewrite` behavior is unchanged; they don't use
+this path yet.
+
+`lab/0` deliberately models a *subset* of YAML and **fails closed** on the
+rest: multi-line (folded) scalars, flow collections that span lines,
+quoted mapping keys, anchors/aliases/merge keys, tabs, and multiple
+documents all produce `accepted: false` with a diagnostic rather than a
+guess. That's the point — a scanner making a security claim must say "I
+can't read this" instead of silently reporting zero references. The
+forthcoming `stable` backend (ADR 0001, PR 2) reads full YAML; `compare`
+mode will measure exactly where the two disagree.
+
 ## Trusted prefixes
 
 Internal reusable workflows (e.g.

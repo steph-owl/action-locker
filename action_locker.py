@@ -14,8 +14,10 @@ import subprocess
 import sys
 import tempfile
 import shutil
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional, Tuple
 
 __version__ = "0.9.0"
 
@@ -700,6 +702,735 @@ def tree_hash(root):
     return f"sha256:{digest}"
 
 
+# --- Parser lab (experimental; ADR 0001) ---
+#
+# Workflow discovery is moving behind parser backends that can be compared
+# differentially (docs/adr/0001-workflow-parser-backends.md and
+# docs/parser-lab/IMPLEMENTATION.md). The legacy scanner above
+# (parse_workflows) remains THE production path for lock/verify/rewrite —
+# nothing below changes its behavior. The `lab/0` backend is that same
+# line-oriented idea made explicit and honest: it assigns semantic paths,
+# classifies reference kinds, excludes comments and block-scalar bodies,
+# and reports what it cannot classify instead of returning nothing.
+#
+# The safety rule for every backend: ambiguity or parser failure must
+# surface as diagnostics with accepted=False — never as an empty success.
+
+PARSER_LAB_SCHEMA_VERSION = 1
+
+REFERENCE_KINDS = (
+    "external-action",
+    "reusable-workflow",
+    "local-action",
+    "docker-image",
+)
+
+
+@dataclass(frozen=True, order=True)
+class WorkflowReference:
+    """One executable `uses:` slot in a workflow file.
+
+    `semantic_path` (jobs.<job_id>.uses or jobs.<job_id>.steps[<i>].uses)
+    is comparison identity across backends; line/column are diagnostics
+    only. `raw_target` is the scalar without quotes or trailing comment.
+    External/reusable targets split at the FINAL `@`; a target that cannot
+    be split is still returned, with action=None/ref=None plus an
+    INVALID_USES_TARGET diagnostic — the parser reports structure, policy
+    judges validity. Positions are 1-based; end positions are None when
+    unknown (lab/0 never fabricates rewrite spans from line matching).
+    """
+    file: str
+    semantic_path: str
+    kind: str
+    raw_target: str
+    action: Optional[str]
+    ref: Optional[str]
+    line: int
+    column: int
+    end_line: Optional[int] = None
+    end_column: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class ParseDiagnostic:
+    """A parser finding. severity `error` means the scan cannot be trusted
+    as complete (the owning ParseResult must carry accepted=False);
+    `warning`/`note` are advisory. Messages never quote arbitrary workflow
+    line content (scripts may embed secrets) — only positions, codes, and
+    `uses` target values."""
+    file: str
+    code: str
+    message: str
+    severity: str
+    line: Optional[int] = None
+    column: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class ParseResult:
+    """What one backend concluded about one file. accepted=False means
+    "this scan is not evidence of absence": callers must treat the file
+    as unverified, never as reference-free."""
+    backend: str
+    references: Tuple[WorkflowReference, ...]
+    diagnostics: Tuple[ParseDiagnostic, ...]
+    accepted: bool
+
+
+# Same owner/repo[/subpath] shape the legacy USES_PATTERN accepts.
+_ACTION_SHAPE = re.compile(
+    r"^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+(?:/[a-zA-Z0-9_./%-]+)?$"
+)
+
+
+def classify_uses_target(raw_target, job_level):
+    """Classify a `uses` scalar -> (kind, action, ref, problem).
+
+    Order per IMPLEMENTATION.md: docker:// first, then local paths, then
+    job-level reusable workflows, then step-level external actions.
+    `problem` explains a target that cannot be split into action@ref (the
+    caller emits INVALID_USES_TARGET); the reference is still returned —
+    never dropped — so downstream policy sees it. Ref VALUES are not
+    filtered here: mutability and validity are verify's job, not the
+    parser's.
+    """
+    if raw_target.startswith("docker://"):
+        return "docker-image", None, None, None
+    if raw_target.startswith("./") or raw_target.startswith("../"):
+        return "local-action", None, None, None
+    kind = "reusable-workflow" if job_level else "external-action"
+    action, sep, ref = raw_target.rpartition("@")
+    if not sep or not action or not ref:
+        return kind, None, None, "target has no @ref"
+    if not _ACTION_SHAPE.match(action):
+        return kind, None, None, "target is not owner/repo[/subpath]@ref"
+    if re.search(r"\s", ref):
+        return kind, None, None, "ref contains whitespace"
+    return kind, action, ref, None
+
+
+class WorkflowParserBackend:
+    """Contract: parse exactly one workflow file into a ParseResult.
+
+    Backends are offline and deterministic: no network, no YAML includes,
+    no reading beyond the given path, no mutation. A backend may support
+    less YAML than GitHub accepts, but it must say so (diagnostics plus
+    accepted=False) rather than return a silently incomplete scan.
+    """
+
+    name = "abstract"
+
+    def parse_file(self, repo_root, path):
+        raise NotImplementedError
+
+
+# Lab v0 line shapes. Every pattern is single-pass with no nested
+# unbounded quantifiers (see the long-line regression tests).
+_LAB_KEY_LINE = re.compile(
+    r"^(?P<key>[A-Za-z_][A-Za-z0-9_.-]*)\s*:(?:[ \t]+(?P<value>.*))?$"
+)
+# Any `uses:`-shaped key (quoted or not) that the scanner did not
+# positively classify or safely exclude must reject the file.
+_LAB_SUSPECT_USES = re.compile(r"""(?<![\w-])["']?uses["']?\s*:""")
+_LAB_BLOCK_HEADER = re.compile(r"^[|>][0-9+-]{0,2}[ \t]*(?:#.*)?$")
+_LAB_JOB_ID = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
+_LAB_SQUOTED = re.compile(r"^'(?P<body>(?:[^']|'')*)'[ \t]*(?:#.*)?$")
+_LAB_DQUOTED = re.compile(r'^"(?P<body>(?:[^"\\]|\\.)*)"[ \t]*(?:#.*)?$')
+# A mapping key written as a QUOTED scalar, e.g. `"uses":` or `'uses':`.
+# lab/0 does not model quoted keys, and — crucially — a quoted key can hide
+# an executable `uses` from a name-based scan: `"uses":` decodes to
+# `uses` on GitHub but shares no literal bytes with `uses`. Any quoted key
+# in the jobs section is therefore rejected outright (fail closed), not
+# guessed. The alternation is linear (no nested unbounded quantifiers).
+_LAB_QUOTED_KEY = re.compile(
+    r"""^(?:"(?:[^"\\]|\\.)*"|'(?:[^']|'')*')[ \t]*:"""
+)
+
+
+def _flow_delta(line):
+    """Net flow-collection nesting change on one line: +1 per unmatched
+    `[`/`{`, -1 per `]`/`}`, ignoring delimiters inside quotes or after a
+    `#` comment. lab/0 does not model flow collections that span lines; the
+    scanner uses this only to notice it is INSIDE an open one and fail
+    closed, never to interpret the flow. Single pass, no backtracking."""
+    depth = 0
+    quote = None
+    i = 0
+    n = len(line)
+    while i < n:
+        c = line[i]
+        if quote == "'":
+            if c == "'":
+                if i + 1 < n and line[i + 1] == "'":
+                    i += 2
+                    continue
+                quote = None
+        elif quote == '"':
+            if c == "\\":
+                i += 2
+                continue
+            if c == '"':
+                quote = None
+        else:
+            if c == "#" and (i == 0 or line[i - 1] in " \t"):
+                break
+            if c in "'\"":
+                quote = c
+            elif c in "[{":
+                depth += 1
+            elif c in "]}":
+                depth -= 1
+        i += 1
+    return depth
+
+
+def _lab_scalar(value):
+    """Extract the text of an inline YAML scalar -> (text, problem).
+
+    Handles plain, single-quoted, and double-quoted scalars with trailing
+    comments. Anything else (anchors, aliases, tags, flow collections,
+    block headers, unterminated quotes, escape sequences) returns
+    (None, why) so the caller fails closed with LAB_UNCLASSIFIED_USES.
+    """
+    if value.startswith("'"):
+        m = _LAB_SQUOTED.match(value)
+        if not m:
+            return None, "unterminated or malformed single-quoted scalar"
+        return m.group("body").replace("''", "'"), None
+    if value.startswith('"'):
+        m = _LAB_DQUOTED.match(value)
+        if not m:
+            return None, "unterminated or malformed double-quoted scalar"
+        body = m.group("body")
+        if "\\" in body:
+            return None, "double-quoted escapes are outside lab/0's language"
+        return body, None
+    if value[:1] in "&*!":
+        return None, "anchors, aliases and tags are outside lab/0's language"
+    if value[:1] in "[{":
+        return None, "flow collections are outside lab/0's language"
+    if value[:1] == "#":
+        return None, "empty scalar"
+    if _LAB_BLOCK_HEADER.match(value):
+        return None, "block scalars are outside lab/0's language for `uses`"
+    text = re.split(r"[ \t]+#", value, maxsplit=1)[0].rstrip()
+    if not text:
+        return None, "empty scalar"
+    return text, None
+
+
+def _lab_scan(rel_file, lines):
+    """Scan decoded workflow lines -> (references, diagnostics, accepted).
+
+    Fail-closed invariants: every `uses:`-shaped line is either emitted as
+    a reference, safely excluded (full-line comment or block-scalar body),
+    or reported as LAB_UNCLASSIFIED_USES with accepted=False. YAML the
+    tracker does not model on a jobs path — anchors/aliases/merge
+    keys/tags in the jobs section, flow-style steps, extra documents, tab
+    indentation, explicit block-scalar indentation — is
+    LAB_UNSUPPORTED_SYNTAX with accepted=False. A repeated semantic path
+    is DUPLICATE_PATH with accepted=False.
+    """
+    references = []
+    diagnostics = []
+    state = {"accepted": True}
+    seen_paths = set()
+
+    def diag(code, message, severity="error", line=None, column=None):
+        diagnostics.append(
+            ParseDiagnostic(rel_file, code, message, severity, line, column)
+        )
+        if severity == "error":
+            state["accepted"] = False
+
+    def emit(path, lineno, key_col, value, value_col, job_level):
+        """Record one `uses` reference; any doubt becomes a diagnostic."""
+        if value is None:
+            diag(
+                "LAB_UNCLASSIFIED_USES",
+                "`uses:` has no inline scalar value",
+                line=lineno, column=key_col + 1,
+            )
+            return
+        scalar, problem = _lab_scalar(value)
+        if scalar is None:
+            diag(
+                "LAB_UNCLASSIFIED_USES",
+                f"`uses:` value not classifiable: {problem}",
+                line=lineno, column=value_col + 1,
+            )
+            return
+        if path in seen_paths:
+            diag(
+                "DUPLICATE_PATH",
+                f"semantic path {path} occurs more than once",
+                line=lineno, column=key_col + 1,
+            )
+            return
+        seen_paths.add(path)
+        kind, action, ref, problem = classify_uses_target(scalar, job_level)
+        if problem:
+            diag(
+                "INVALID_USES_TARGET",
+                f"`{scalar}`: {problem}",
+                severity="warning", line=lineno, column=value_col + 1,
+            )
+        references.append(WorkflowReference(
+            file=rel_file, semantic_path=path, kind=kind, raw_target=scalar,
+            action=action, ref=ref, line=lineno, column=value_col + 1,
+        ))
+
+    block = None            # {"key_indent": int, "content_indent": int|None}
+    doc_started = False     # any structural content seen yet
+    doc_marker = False      # a leading `---` seen
+    top_keys_seen = set()
+    jobs_open = False       # inside a block-mapping `jobs:` section
+    job_indent = None       # indent of job-id keys
+    job_ids = set()
+    cur_job = None
+    job_child_indent = None  # indent of keys inside the current job
+    in_steps = False
+    steps_key_indent = None
+    item_indent = None      # dash column of step items
+    step_index = -1
+    step_key_indent = None  # key column inside the current step item
+    flow_depth = 0          # open [ ] / { } nesting carried across lines
+
+    for lineno, raw in enumerate(lines, 1):
+        line = raw.rstrip("\r")
+
+        # Block-scalar bodies are opaque text: nothing inside one can be
+        # an executable `uses` — and nothing inside one may leak out as a
+        # fake reference either.
+        if block is not None:
+            if not line.strip():
+                continue
+            body_indent = len(line) - len(line.lstrip(" "))
+            if body_indent > block["key_indent"]:
+                if block["content_indent"] is None:
+                    block["content_indent"] = body_indent
+                elif body_indent < block["content_indent"]:
+                    diag(
+                        "LAB_UNSUPPORTED_SYNTAX",
+                        "block scalar dedents below its first content line",
+                        line=lineno,
+                    )
+                continue
+            block = None  # this line ends the block; process it normally
+
+        stripped = line.strip()
+        if not stripped:
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        if line[indent:indent + 1] == "\t":
+            diag("LAB_UNSUPPORTED_SYNTAX", "tab indentation", line=lineno)
+            continue
+        if stripped.startswith("#"):
+            continue  # full-line comments are structure-free by definition
+        if stripped.startswith("%") and not doc_started:
+            diag(
+                "LAB_UNSUPPORTED_SYNTAX",
+                "YAML directives are outside lab/0's language",
+                line=lineno,
+            )
+            continue
+        if stripped == "---" or stripped.startswith("--- "):
+            if doc_started or doc_marker or stripped != "---":
+                diag(
+                    "LAB_UNSUPPORTED_SYNTAX",
+                    "multiple YAML documents (or content after `---`)",
+                    line=lineno,
+                )
+            doc_marker = True
+            continue
+        if stripped == "..." or stripped.startswith("... "):
+            diag("LAB_UNSUPPORTED_SYNTAX", "document end marker", line=lineno)
+            continue
+        doc_started = True
+
+        # Flow collections that span lines defeat the block tracker: a
+        # continuation line (e.g. the second half of `- { name: x,` \n
+        # `uses: a/b@v1 }`) looks like an ordinary mapping key and would be
+        # emitted with the closing `}` glued onto its target. lab/0 does
+        # not model multi-line flow — once one is open, every line inside
+        # it is rejected. Balanced single-line flow (a matrix `[a, b]`)
+        # nets to zero and is unaffected; a `uses` lookalike on such a line
+        # is still caught by the suspicion net. The depth update runs
+        # before any downstream `continue` so it can never be skipped.
+        if flow_depth > 0:
+            diag(
+                "LAB_UNSUPPORTED_SYNTAX",
+                "multi-line flow collection is outside lab/0's language",
+                line=lineno,
+            )
+            flow_depth = max(0, flow_depth + _flow_delta(line))
+            continue
+        flow_depth = max(0, flow_depth + _flow_delta(line))
+
+        # Split leading sequence dashes off the line (`- uses: x`,
+        # `- - x`, a lone `-`), tracking the column where content starts.
+        rest = line[indent:]
+        col = indent
+        dash_cols = []
+        while rest == "-" or rest.startswith("- "):
+            dash_cols.append(col)
+            if rest == "-":
+                col += 1
+                rest = ""
+                break
+            advance = 1
+            while advance < len(rest) and rest[advance] == " ":
+                advance += 1
+            col += advance
+            rest = rest[advance:]
+
+        key = value = None
+        value_col = col
+        km = _LAB_KEY_LINE.match(rest)
+        if km:
+            key = km.group("key")
+            value = km.group("value")
+            if value is not None:
+                if not value.strip() or value.lstrip().startswith("#"):
+                    value = None
+                else:
+                    value_col = col + km.start("value")
+                    value = value.rstrip()
+
+        # A QUOTED mapping key in the jobs section is not modeled — and is
+        # a fail-open risk the name-based suspicion net cannot cover: a key
+        # written `"uses":` (or with an escape, `"uses":`) executes as
+        # `uses` on GitHub while sharing no literal bytes with `uses`. So a
+        # quoted key inside `jobs:` is rejected outright rather than
+        # guessed. At column 0 it is instead a new top-level section
+        # (unusual, but `"on":` is legal), which simply ends the jobs block.
+        if jobs_open and km is None and _LAB_QUOTED_KEY.match(rest):
+            if indent == 0 and not dash_cols:
+                jobs_open = False
+                job_indent = cur_job = job_child_indent = None
+                in_steps = False
+                steps_key_indent = item_indent = step_key_indent = None
+                step_index = -1
+                continue
+            diag(
+                "LAB_UNSUPPORTED_SYNTAX",
+                "quoted mapping key in the jobs section is outside lab/0's "
+                "language (a quoted key can hide an executable `uses`)",
+                line=lineno,
+            )
+            continue
+
+        # Merge keys and complex keys inside jobs can inject steps the
+        # tracker cannot see — fail closed.
+        if jobs_open and (
+            rest.startswith("<<") or rest == "?" or rest.startswith("? ")
+        ):
+            diag(
+                "LAB_UNSUPPORTED_SYNTAX",
+                "merge/complex keys are outside lab/0's language",
+                line=lineno,
+            )
+            continue
+
+        # Does this line open a block scalar? (Its body is opaque text.)
+        opens_block = None
+        if key is not None and value is not None and _LAB_BLOCK_HEADER.match(value):
+            opens_block = {"key_indent": col, "content_indent": None}
+        elif dash_cols and rest and _LAB_BLOCK_HEADER.match(rest):
+            opens_block = {"key_indent": dash_cols[-1], "content_indent": None}
+        if opens_block is not None and re.search(r"\d", (value or rest)[:3]):
+            diag(
+                "LAB_UNSUPPORTED_SYNTAX",
+                "explicit block-scalar indentation indicator",
+                line=lineno,
+            )
+
+        handled = False
+
+        if key is not None and not dash_cols and indent == 0:
+            # A top-level section key. Duplicates are duplicate YAML keys
+            # (GitHub rejects the file) and would corrupt path identity.
+            if key in top_keys_seen:
+                diag(
+                    "LAB_UNSUPPORTED_SYNTAX",
+                    f"duplicate top-level key `{key}`",
+                    line=lineno,
+                )
+            top_keys_seen.add(key)
+            jobs_open = key == "jobs" and value is None and opens_block is None
+            job_indent = None
+            cur_job = None
+            job_child_indent = None
+            in_steps = False
+            steps_key_indent = None
+            item_indent = None
+            step_index = -1
+            step_key_indent = None
+            # `jobs:` with an inline value (flow mapping, anchor, alias)
+            # is outside the modeled language; any `uses:` under it falls
+            # through to the suspicion net below.
+        elif jobs_open and key is not None and not dash_cols:
+            # A mapping key somewhere inside the `jobs:` block.
+            if value is not None and value[:1] in "&*!":
+                diag(
+                    "LAB_UNSUPPORTED_SYNTAX",
+                    "anchor/alias/tag in the jobs section",
+                    line=lineno,
+                )
+                handled = True
+            elif job_indent is None or indent == job_indent:
+                job_indent = indent
+                cur_job = key
+                job_child_indent = None
+                in_steps = False
+                steps_key_indent = None
+                item_indent = None
+                step_index = -1
+                step_key_indent = None
+                if not _LAB_JOB_ID.match(key):
+                    diag(
+                        "LAB_UNSUPPORTED_SYNTAX",
+                        "job id does not fit lab/0's path grammar",
+                        line=lineno,
+                    )
+                elif key in job_ids:
+                    diag(
+                        "LAB_UNSUPPORTED_SYNTAX",
+                        f"duplicate job id `{key}`",
+                        line=lineno,
+                    )
+                job_ids.add(key)
+            elif indent < job_indent:
+                diag(
+                    "LAB_UNSUPPORTED_SYNTAX",
+                    "unexpected dedent inside `jobs:`",
+                    line=lineno,
+                )
+            elif cur_job is None:
+                diag(
+                    "LAB_UNSUPPORTED_SYNTAX",
+                    "mapping nested under `jobs:` without a job id",
+                    line=lineno,
+                )
+            else:
+                if job_child_indent is None:
+                    job_child_indent = indent
+                if indent == job_child_indent:
+                    in_steps = False
+                    if key == "steps":
+                        if value is not None or opens_block is not None:
+                            diag(
+                                "LAB_UNSUPPORTED_SYNTAX",
+                                "`steps:` with an inline or block value",
+                                line=lineno,
+                            )
+                            handled = True
+                        else:
+                            in_steps = True
+                            steps_key_indent = indent
+                            item_indent = None
+                            step_index = -1
+                            step_key_indent = None
+                    elif key == "uses":
+                        emit(
+                            f"jobs.{cur_job}.uses", lineno, col,
+                            value, value_col, job_level=True,
+                        )
+                        handled = True
+                elif indent > job_child_indent:
+                    if in_steps and item_indent is not None and step_index >= 0:
+                        if step_key_indent is None and indent > item_indent:
+                            step_key_indent = indent
+                        if indent == step_key_indent and key == "uses":
+                            emit(
+                                f"jobs.{cur_job}.steps[{step_index}].uses",
+                                lineno, col, value, value_col,
+                                job_level=False,
+                            )
+                            handled = True
+                    # Otherwise: nested config under a job or step key —
+                    # not a `uses` slot; the suspicion net still applies.
+                else:
+                    diag(
+                        "LAB_UNSUPPORTED_SYNTAX",
+                        f"unexpected dedent inside job `{cur_job}`",
+                        line=lineno,
+                    )
+        elif jobs_open and dash_cols:
+            if not in_steps or cur_job is None:
+                # A sequence outside steps (matrix values, branch lists…)
+                # cannot hold an executable `uses` — the net still looks.
+                pass
+            else:
+                d = dash_cols[0]
+                if item_indent is None:
+                    if d >= steps_key_indent:
+                        item_indent = d
+                    else:
+                        diag(
+                            "LAB_UNSUPPORTED_SYNTAX",
+                            "sequence item left of its `steps:` key",
+                            line=lineno,
+                        )
+                        handled = True
+                if item_indent is not None and d == item_indent:
+                    if len(dash_cols) > 1:
+                        diag(
+                            "LAB_UNSUPPORTED_SYNTAX",
+                            "nested sequence in `steps`",
+                            line=lineno,
+                        )
+                        handled = True
+                    else:
+                        step_index += 1
+                        step_key_indent = None
+                        if rest == "":
+                            pass  # a lone dash; keys follow on later lines
+                        elif key is not None:
+                            step_key_indent = col
+                            if value is not None and value[:1] in "&*!":
+                                diag(
+                                    "LAB_UNSUPPORTED_SYNTAX",
+                                    "anchor/alias/tag in the jobs section",
+                                    line=lineno,
+                                )
+                                handled = True
+                            elif key == "uses":
+                                emit(
+                                    f"jobs.{cur_job}.steps[{step_index}].uses",
+                                    lineno, col, value, value_col,
+                                    job_level=False,
+                                )
+                                handled = True
+                        elif rest[:1] in "&*!":
+                            diag(
+                                "LAB_UNSUPPORTED_SYNTAX",
+                                "anchor/alias/tag step item",
+                                line=lineno,
+                            )
+                            handled = True
+                        # else: a scalar step — GitHub rejects those; the
+                        # suspicion net still guards `uses:` lookalikes.
+                elif item_indent is not None and d > item_indent:
+                    pass  # a sequence inside a step field — net applies
+                elif item_indent is not None:
+                    diag(
+                        "LAB_UNSUPPORTED_SYNTAX",
+                        "unexpected sequence dedent inside `steps`",
+                        line=lineno,
+                    )
+                    handled = True
+
+        # The suspicion net: a `uses:`-shaped token anywhere on a line the
+        # scanner did not positively classify or safely exclude is
+        # uncertainty, and uncertainty is never reported as absence.
+        if not handled:
+            suspect = _LAB_SUSPECT_USES.search(line)
+            if suspect:
+                diag(
+                    "LAB_UNCLASSIFIED_USES",
+                    "`uses:`-shaped text the scanner cannot place at "
+                    "jobs.<job>.uses or jobs.<job>.steps[<i>].uses",
+                    line=lineno, column=suspect.start() + 1,
+                )
+            elif jobs_open and key is None and not dash_cols:
+                # Inside a block mapping, every line is a `key:`, a `- item`,
+                # a comment, or blank. A bare scalar line is none of those:
+                # it is a multi-line plain-scalar CONTINUATION that folds
+                # into the previous value on GitHub (so a `uses:` already
+                # emitted from that value's first line is truncated). lab/0
+                # does not model line folding — fail closed rather than
+                # trust a half-read scalar.
+                diag(
+                    "LAB_UNSUPPORTED_SYNTAX",
+                    "unrecognized line in the jobs section — multi-line "
+                    "scalars and other unmodeled constructs are outside "
+                    "lab/0's language",
+                    line=lineno,
+                )
+
+        if opens_block is not None:
+            block = opens_block
+
+    return references, diagnostics, state["accepted"]
+
+
+class LegacyRegexBackend(WorkflowParserBackend):
+    """Lab v0 (`lab/0`): the legacy line scanner behind the backend seam.
+
+    A minimal indentation-aware tracker assigns each accepted `uses:` a
+    semantic path (jobs.<job>.uses or jobs.<job>.steps[<i>].uses),
+    excludes full-line comments and block-scalar bodies, and REJECTS the
+    file (accepted=False — never an empty success) whenever it meets
+    syntax it does not model safely. Scan-only: it never rewrites, never
+    touches the network, and reads only the file it was given.
+
+    Known, intentional differences from the legacy parse_workflows scanner
+    (which production commands still use, unchanged): lab/0 excludes fake
+    `uses:` inside block scalars instead of matching them, returns local
+    and docker references as classified kinds instead of skipping them,
+    and does not pre-filter ref values (policy's job). Compare mode
+    (ADR 0001 PR 2) exists to measure exactly these gaps.
+    """
+
+    name = "lab/0"
+
+    def parse_file(self, repo_root, path):
+        """Parse one workflow file. I/O or decoding failure is reported as
+        LAB_IO_ERROR with accepted=False — never as an empty result."""
+        path = Path(path)
+        repo_root = Path(repo_root)
+        try:
+            rel = path.resolve().relative_to(repo_root.resolve()).as_posix()
+        except ValueError:
+            rel = path.as_posix()
+        try:
+            text = path.read_bytes().decode("utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            note = ParseDiagnostic(
+                rel, "LAB_IO_ERROR",
+                f"cannot read workflow as UTF-8 text: {exc.__class__.__name__}",
+                "error", None, None,
+            )
+            return ParseResult(self.name, (), (note,), accepted=False)
+        if text.startswith("\ufeff"):
+            text = text[1:]
+        references, diagnostics, accepted = _lab_scan(rel, text.split("\n"))
+        return ParseResult(
+            backend=self.name,
+            references=tuple(sorted(references)),
+            diagnostics=tuple(diagnostics),
+            accepted=accepted,
+        )
+
+
+PARSER_BACKENDS = {"lab": LegacyRegexBackend}
+
+
+def _reference_as_json(ref):
+    return {
+        "semantic_path": ref.semantic_path,
+        "kind": ref.kind,
+        "raw_target": ref.raw_target,
+        "action": ref.action,
+        "ref": ref.ref,
+        "line": ref.line,
+        "column": ref.column,
+        "end_line": ref.end_line,
+        "end_column": ref.end_column,
+    }
+
+
+def _diagnostic_as_json(diagnostic):
+    return {
+        "code": diagnostic.code,
+        "message": diagnostic.message,
+        "severity": diagnostic.severity,
+        "line": diagnostic.line,
+        "column": diagnostic.column,
+    }
+
+
 # --- Commands ---
 
 def cmd_lock(args, repo_root):
@@ -1330,6 +2061,108 @@ def cmd_rewrite(args, repo_root):
     print(f"\n{rewrites} reference(s) rewritten to pinned SHAs.")
 
 
+def cmd_scan(args, repo_root):
+    """Structurally scan workflows with an experimental parser backend.
+
+    Read-only and fully offline: parses workflow bytes, prints results,
+    touches nothing. Production commands (lock/verify/rewrite) do NOT use
+    this path yet — see ADR 0001.
+
+    Exit codes (docs/parser-lab/IMPLEMENTATION.md): 0 = parsed cleanly;
+    1 = a file was rejected (parser uncertainty is an error, never an
+    empty result); 2 = invalid configuration; 4 = requested backend
+    unavailable.
+    """
+    requested = (
+        args.parser_backend
+        or os.environ.get("ACTION_LOCKER_PARSER")
+        or "lab"
+    )
+    if requested not in ("lab", "stable", "compare"):
+        print(
+            f"Error: unknown parser backend `{requested}` "
+            f"(from --parser or ACTION_LOCKER_PARSER)",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if requested not in PARSER_BACKENDS:
+        print(
+            f"Error: parser backend `{requested}` is not implemented yet "
+            f"(see docs/parser-lab/IMPLEMENTATION.md); available: "
+            f"{', '.join(sorted(PARSER_BACKENDS))}",
+            file=sys.stderr,
+        )
+        sys.exit(4)
+    backend = PARSER_BACKENDS[requested]()
+    if not os.environ.get("ACTION_LOCKER_PARSER_LAB_CI"):
+        print(
+            yellow(
+                f"note: `{backend.name}` is an experimental parser backend; "
+                f"production commands still use the built-in scanner "
+                f"(ADR 0001). Set ACTION_LOCKER_PARSER_LAB_CI=1 to silence."
+            ),
+            file=sys.stderr,
+        )
+
+    workflows_dir = repo_root / ".github" / "workflows"
+    wf_files = []
+    if workflows_dir.is_dir():
+        wf_files = sorted(workflows_dir.glob("*.yml")) + sorted(
+            workflows_dir.glob("*.yaml")
+        )
+    results = sorted(
+        (
+            (f.relative_to(repo_root).as_posix(), backend.parse_file(repo_root, f))
+            for f in wf_files
+        ),
+        key=lambda item: item[0],
+    )
+    all_accepted = all(r.accepted for _, r in results)
+
+    if args.format == "json":
+        payload = {
+            "schema_version": PARSER_LAB_SCHEMA_VERSION,
+            "backend": backend.name,
+            "accepted": all_accepted,
+            "files": [
+                {
+                    "path": rel,
+                    "accepted": r.accepted,
+                    "references": [_reference_as_json(x) for x in r.references],
+                    "diagnostics": [_diagnostic_as_json(d) for d in r.diagnostics],
+                }
+                for rel, r in results
+            ],
+        }
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        total_refs = 0
+        for rel, r in results:
+            if r.accepted:
+                print(f"{rel} ({len(r.references)} reference(s))")
+            else:
+                print(red(f"REJECTED {rel}"))
+            for x in r.references:
+                total_refs += 1
+                print(f"  {x.semantic_path}  {x.kind}  {x.raw_target}")
+            for d in r.diagnostics:
+                paint = red if d.severity == "error" else yellow
+                where = f" line {d.line}" if d.line else ""
+                print(paint(f"  {d.severity}[{d.code}]{where}: {d.message}"))
+        if not results:
+            print(f"No workflow files found under {workflows_dir}")
+        summary = (
+            f"\n{len(results)} file(s), {total_refs} reference(s), "
+            f"backend {backend.name}"
+        )
+        if all_accepted:
+            print(green(summary))
+        else:
+            print(red(summary + " — rejected file(s) present"))
+
+    sys.exit(0 if all_accepted else 1)
+
+
 # --- CLI ---
 
 def main():
@@ -1384,6 +2217,21 @@ def main():
     # rewrite
     subparsers.add_parser("rewrite", help="Rewrite workflow files to use pinned SHAs from lockfile")
 
+    # scan (experimental parser lab — ADR 0001)
+    scan_parser = subparsers.add_parser(
+        "scan",
+        help="(experimental) structurally scan workflows for `uses` references",
+    )
+    scan_parser.add_argument(
+        "--parser", dest="parser_backend",
+        choices=["lab", "stable", "compare"], default=None,
+        help="parser backend (default: ACTION_LOCKER_PARSER env var, else `lab`)",
+    )
+    scan_parser.add_argument(
+        "--format", choices=["text", "json"], default="text",
+        help="output format (json is deterministic and schema-versioned)",
+    )
+
     args = parser.parse_args()
     repo_root = find_repo_root()
 
@@ -1393,6 +2241,7 @@ def main():
         "vendor": cmd_vendor,
         "update": cmd_update,
         "rewrite": cmd_rewrite,
+        "scan": cmd_scan,
     }
 
     commands[args.command](args, repo_root)
