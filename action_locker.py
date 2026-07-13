@@ -845,6 +845,31 @@ _LAB_DQUOTED = re.compile(r'^"(?P<body>(?:[^"\\]|\\.)*)"[ \t]*(?:#.*)?$')
 _LAB_QUOTED_KEY = re.compile(
     r"""^(?:"(?:[^"\\]|\\.)*"|'(?:[^']|'')*')[ \t]*:"""
 )
+# Plain (unquoted) scalars that a YAML 1.2 loader resolves to a NON-STRING
+# value: null/bool/int/float, plus the timestamp/date forms ruamel's
+# round-trip resolver retains. The stable backend fails such nodes closed
+# (USES_NOT_STRING / NON_STRING_KEY); lab/0 must never ACCEPT bytes stable
+# rejects, so a plain scalar matching this in a `uses` slot or a tracked
+# mapping key fails closed here too. Deliberately NOT included: the YAML
+# 1.1-only booleans (yes/no/on/off) — in 1.2 those are ordinary strings,
+# and `on:` heads every workflow. Single pass, no nested unbounded
+# quantifiers.
+_LAB_NONSTRING_PLAIN = re.compile(
+    r"""^(?:
+        ~|null|Null|NULL
+        |true|True|TRUE|false|False|FALSE
+        |[-+]?[0-9][0-9_]*                              # decimal int
+        |0[oO][0-7]+                                    # octal int
+        |[-+]?0[xX][0-9a-fA-F]+                         # hex int
+        |[-+]?(?:[0-9][0-9_]*\.[0-9_]*|\.[0-9][0-9_]*)  # float
+            (?:[eE][-+]?[0-9]+)?
+        |[-+]?[0-9][0-9_]*[eE][-+]?[0-9]+               # exponent float
+        |[-+]?\.(?:inf|Inf|INF)|\.(?:nan|NaN|NAN)
+        |[0-9]{4}-[0-9]{1,2}-[0-9]{1,2}                 # date / timestamp
+            (?:[Tt ][0-9][0-9:.+\-TtZz ]*)?
+    )$""",
+    re.VERBOSE,
+)
 
 
 def _flow_delta(line):
@@ -929,7 +954,15 @@ def _lab_scan(rel_file, lines):
     keys/tags in the jobs section, flow-style steps, extra documents, tab
     indentation, explicit block-scalar indentation — is
     LAB_UNSUPPORTED_SYNTAX with accepted=False. A repeated semantic path
-    is DUPLICATE_PATH with accepted=False.
+    is DUPLICATE_PATH with accepted=False. A repeated key in any tracked
+    block mapping is DUPLICATE_KEY with accepted=False (GitHub rejects the
+    file, and a duplicate `steps:`/`jobs:` would re-anchor path identity
+    mid-scan). Plain scalars that YAML 1.2 types as non-strings
+    (true/null/123/dates) in a `uses` slot or a tracked mapping key fail
+    closed — the structural backend rejects those bytes, and lab/0 must
+    never accept what stable rejects. A quoted scalar value that does not
+    close on its own line, or a flow collection still open at end of
+    file, is LAB_UNSUPPORTED_SYNTAX with accepted=False.
     """
     references = []
     diagnostics = []
@@ -957,6 +990,18 @@ def _lab_scan(rel_file, lines):
             diag(
                 "LAB_UNCLASSIFIED_USES",
                 f"`uses:` value not classifiable: {problem}",
+                line=lineno, column=value_col + 1,
+            )
+            return
+        if value[:1] not in ("'", '"') and _LAB_NONSTRING_PLAIN.match(scalar):
+            # A plain `true`/`null`/`123`/date is a non-string YAML node:
+            # stable fails it closed as USES_NOT_STRING, so lab/0 must not
+            # accept it as a string reference. (Quoted, it IS a string and
+            # flows through as an INVALID_USES_TARGET warning, matching
+            # stable.)
+            diag(
+                "LAB_UNCLASSIFIED_USES",
+                "plain `uses:` scalar resolves to a non-string YAML type",
                 line=lineno, column=value_col + 1,
             )
             return
@@ -995,6 +1040,7 @@ def _lab_scan(rel_file, lines):
     step_index = -1
     step_key_indent = None  # key column inside the current step item
     flow_depth = 0          # open [ ] / { } nesting carried across lines
+    frames = []             # [key column, keys seen] per open block mapping
 
     for lineno, raw in enumerate(lines, 1):
         line = raw.rstrip("\r")
@@ -1097,6 +1143,57 @@ def _lab_scan(rel_file, lines):
                     value_col = col + km.start("value")
                     value = value.rstrip()
 
+        # Duplicate mapping keys anywhere in the document: GitHub rejects
+        # the file outright, and a duplicate on a tracked path (`steps:`
+        # twice in one job) would silently re-anchor the tracker mid-job.
+        # Block-mapping nesting is modeled as frames of (key column, keys
+        # seen); a shallower key or a new sequence item closes every frame
+        # opened deeper than it. Quoted keys are not tracked here — inside
+        # `jobs:` they are rejected wholesale below, elsewhere they are
+        # outside lab/0's modeled language.
+        if dash_cols:
+            while frames and frames[-1][0] > dash_cols[0]:
+                frames.pop()
+        if key is not None:
+            while frames and frames[-1][0] > col:
+                frames.pop()
+            if frames and frames[-1][0] == col:
+                if key in frames[-1][1]:
+                    diag(
+                        "DUPLICATE_KEY",
+                        f"duplicate mapping key `{key}` "
+                        "(GitHub rejects the workflow)",
+                        line=lineno, column=col + 1,
+                    )
+                frames[-1][1].add(key)
+            else:
+                frames.append((col, {key}))
+
+        # A value (or scalar sequence item) that OPENS a quote but does not
+        # CLOSE it on the same line is a multi-line quoted scalar — legal
+        # YAML, but a construct lab/0 does not model; content after a closed
+        # quote is malformed YAML outright. Either way: fail closed rather
+        # than scan half a scalar. (A plain scalar merely CONTAINING quotes,
+        # like `run: echo "don't`, starts with a letter and is untouched.)
+        quote_opening = None
+        if key is not None and value is not None and value[:1] in ("'", '"'):
+            quote_opening = value
+        elif (
+            km is None
+            and rest[:1] in ("'", '"')
+            and not _LAB_QUOTED_KEY.match(rest)
+        ):
+            quote_opening = rest
+        if quote_opening is not None:
+            fullq = _LAB_SQUOTED if quote_opening[0] == "'" else _LAB_DQUOTED
+            if not fullq.match(quote_opening):
+                diag(
+                    "LAB_UNSUPPORTED_SYNTAX",
+                    "quoted scalar does not end on its own line "
+                    "(multi-line quoted scalars are outside lab/0's language)",
+                    line=lineno,
+                )
+
         # A QUOTED mapping key in the jobs section is not modeled — and is
         # a fail-open risk the name-based suspicion net cannot cover: a key
         # written `"uses":` (or with an escape, `"uses":`) executes as
@@ -1157,6 +1254,16 @@ def _lab_scan(rel_file, lines):
                     line=lineno,
                 )
             top_keys_seen.add(key)
+            if _LAB_NONSTRING_PLAIN.match(key):
+                # Stable fails non-string keys closed at every container on
+                # the `uses` path (NON_STRING_KEY); mirror it at the levels
+                # lab/0 tracks so lab never accepts what stable rejects.
+                diag(
+                    "LAB_UNSUPPORTED_SYNTAX",
+                    f"top-level key `{key}` resolves to a non-string "
+                    "YAML type",
+                    line=lineno,
+                )
             jobs_open = key == "jobs" and value is None and opens_block is None
             job_indent = None
             cur_job = None
@@ -1193,6 +1300,12 @@ def _lab_scan(rel_file, lines):
                         "job id does not fit lab/0's path grammar",
                         line=lineno,
                     )
+                elif _LAB_NONSTRING_PLAIN.match(key):
+                    diag(
+                        "LAB_UNSUPPORTED_SYNTAX",
+                        f"job id `{key}` resolves to a non-string YAML type",
+                        line=lineno,
+                    )
                 elif key in job_ids:
                     diag(
                         "LAB_UNSUPPORTED_SYNTAX",
@@ -1216,6 +1329,13 @@ def _lab_scan(rel_file, lines):
                 if job_child_indent is None:
                     job_child_indent = indent
                 if indent == job_child_indent:
+                    if _LAB_NONSTRING_PLAIN.match(key):
+                        diag(
+                            "LAB_UNSUPPORTED_SYNTAX",
+                            f"job field key `{key}` resolves to a "
+                            "non-string YAML type",
+                            line=lineno,
+                        )
                     in_steps = False
                     if key == "steps":
                         if value is not None or opens_block is not None:
@@ -1241,6 +1361,16 @@ def _lab_scan(rel_file, lines):
                     if in_steps and item_indent is not None and step_index >= 0:
                         if step_key_indent is None and indent > item_indent:
                             step_key_indent = indent
+                        if (
+                            indent == step_key_indent
+                            and _LAB_NONSTRING_PLAIN.match(key)
+                        ):
+                            diag(
+                                "LAB_UNSUPPORTED_SYNTAX",
+                                f"step key `{key}` resolves to a "
+                                "non-string YAML type",
+                                line=lineno,
+                            )
                         if indent == step_key_indent and key == "uses":
                             emit(
                                 f"jobs.{cur_job}.steps[{step_index}].uses",
@@ -1288,6 +1418,13 @@ def _lab_scan(rel_file, lines):
                             pass  # a lone dash; keys follow on later lines
                         elif key is not None:
                             step_key_indent = col
+                            if _LAB_NONSTRING_PLAIN.match(key):
+                                diag(
+                                    "LAB_UNSUPPORTED_SYNTAX",
+                                    f"step key `{key}` resolves to a "
+                                    "non-string YAML type",
+                                    line=lineno,
+                                )
                             if value is not None and value[:1] in "&*!":
                                 diag(
                                     "LAB_UNSUPPORTED_SYNTAX",
@@ -1348,9 +1485,41 @@ def _lab_scan(rel_file, lines):
                     "lab/0's language",
                     line=lineno,
                 )
+            elif indent == 0 and dash_cols:
+                # A workflow root is a block mapping; a root-level sequence
+                # item means the document is not a workflow shape stable
+                # accepts (ROOT_NOT_MAPPING / JOBS_NOT_MAPPING).
+                diag(
+                    "LAB_UNSUPPORTED_SYNTAX",
+                    "sequence item at the document root — a workflow root "
+                    "must be a block mapping",
+                    line=lineno,
+                )
+            elif indent == 0 and key is None and not _LAB_QUOTED_KEY.match(rest):
+                # A root line that is neither a plain key, a quoted string
+                # key, a comment, nor a document marker: a non-string key
+                # (`123:`), a flow/complex key, or a stray scalar. Stable
+                # fails all of these closed (NON_STRING_KEY or
+                # ROOT_NOT_MAPPING); lab/0 must not accept what stable
+                # rejects.
+                diag(
+                    "LAB_UNSUPPORTED_SYNTAX",
+                    "unmodeled top-level line — a workflow root must be a "
+                    "block mapping with string keys",
+                    line=lineno,
+                )
 
         if opens_block is not None:
             block = opens_block
+
+    if flow_depth > 0:
+        # `broken: [never closed` at end of file: the flow tracker is still
+        # inside an open collection, so the document cannot have parsed as
+        # complete YAML. Unfinished syntax is rejected, not ignored.
+        diag(
+            "LAB_UNSUPPORTED_SYNTAX",
+            "flow collection still open at end of file",
+        )
 
     return references, diagnostics, state["accepted"]
 
@@ -1724,18 +1893,22 @@ PARSER_BACKENDS = {"lab": LegacyRegexBackend}
 
 
 def stable_backend_available():
-    """True when ruamel.yaml is importable, so the `stable` backend can run.
+    """True when ruamel.yaml is importable AND is the exact pinned release.
 
-    The import is lazy and its failure is reported as `backend unavailable`
-    (scan exit code 4), never a crash and never a silent fall back to
-    another backend — a security scanner must not quietly answer with a
-    different engine than the one requested.
+    The pin is part of the security claim, not a suggestion: `stable` is
+    developed and differential-tested against one specific parser closure
+    (STABLE_RUAMEL_PIN), and a different ruamel release can legitimately
+    resolve scalars or duplicate keys differently. Running against an
+    unpinned version would silently change what the authoritative backend
+    accepts. The import is lazy and any failure — missing OR mismatched —
+    is reported as `backend unavailable` (scan exit code 4), never a crash
+    and never a silent fall back to another backend or another version.
     """
     try:
-        import ruamel.yaml  # noqa: F401
+        import ruamel.yaml
     except ImportError:
         return False
-    return True
+    return getattr(ruamel.yaml, "__version__", None) == STABLE_RUAMEL_PIN
 
 
 # Disagreement classes, ordered most-actionable first for display.
@@ -2520,7 +2693,8 @@ def cmd_scan(args, repo_root):
         if not stable_backend_available():
             print(
                 "Error: parser backend `stable` requires ruamel.yaml "
-                f"(pinned {STABLE_RUAMEL_PIN}), which is not installed. "
+                f"=={STABLE_RUAMEL_PIN} exactly, which is not installed "
+                "(a different installed version also counts as unavailable). "
                 "Install the optional extra: pip install 'action-locker[stable]'",
                 file=sys.stderr,
             )
@@ -2615,7 +2789,8 @@ def _cmd_scan_compare(args, repo_root):
     if not stable_backend_available():
         print(
             "Error: parser backend `compare` requires the `stable` backend, "
-            f"which needs ruamel.yaml (pinned {STABLE_RUAMEL_PIN}). "
+            f"which needs ruamel.yaml =={STABLE_RUAMEL_PIN} exactly "
+            "(a different installed version also counts as unavailable). "
             "Install the optional extra: pip install 'action-locker[stable]'",
             file=sys.stderr,
         )
