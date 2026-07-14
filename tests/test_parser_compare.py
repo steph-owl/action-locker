@@ -1,8 +1,8 @@
 """Differential `compare` mode tests (ADR 0001 PR 2, final piece).
 
 compare runs lab/0 and the authoritative stable backend over the same bytes
-and diffs their normalized results. It needs ruamel (via stable), so the
-module skips when ruamel is absent.
+and diffs their normalized results. Stable always uses the pinned vendored
+ruamel closure.
 
 The distinction under test is the one that makes compare useful without
 becoming false confidence: an EXPECTED disagreement (stable reads what lab
@@ -16,8 +16,6 @@ import json
 from pathlib import Path
 
 import pytest
-
-pytest.importorskip("ruamel.yaml")
 
 import action_locker
 from action_locker import (

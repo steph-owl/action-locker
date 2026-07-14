@@ -45,7 +45,7 @@ def codes_of(result):
     return {d.code for d in result.diagnostics}
 
 
-def run_scan(repo_root, fmt="json", parser=None):
+def run_scan(repo_root, fmt="json", parser="lab"):
     args = argparse.Namespace(parser_backend=parser, format=fmt)
     with pytest.raises(SystemExit) as exc:
         cmd_scan(args, repo_root)
@@ -647,9 +647,9 @@ class TestLegacyPathUntouched:
     def test_legacy_scanner_still_matches_inside_run_blocks(self, tmp_path, capsys):
         """parse_workflows keeps its known false positive on `uses:` text
         inside `run: |` blocks. That is intentional in PR 1: production
-        lock/verify behavior must not change until backends are selectable
-        (ADR 0001, PR 3). lab/0 already excludes it — this asserted
-        difference is the first compare-mode disagreement fixture."""
+        The private legacy compatibility scanner sees this script text while
+        lab/0 excludes it. This test preserves the historical distinction;
+        production commands now use stable."""
         content = (
             "jobs:\n  a:\n    steps:\n"
             "      - run: |\n"
@@ -739,12 +739,12 @@ class TestScanCli:
 
     def test_env_var_selects_backend(self, owl_repo, monkeypatch, capsys):
         monkeypatch.setenv("ACTION_LOCKER_PARSER", "lab")
-        assert run_scan(owl_repo) == 0
+        assert run_scan(owl_repo, parser=None) == 0
         capsys.readouterr()
 
     def test_invalid_env_backend_exits_2(self, owl_repo, monkeypatch, capsys):
         monkeypatch.setenv("ACTION_LOCKER_PARSER", "regex-classic")
-        assert run_scan(owl_repo) == 2
+        assert run_scan(owl_repo, parser=None) == 2
         assert "unknown parser backend" in capsys.readouterr().err
 
     def test_explicit_parser_beats_env(self, owl_repo, monkeypatch, capsys):

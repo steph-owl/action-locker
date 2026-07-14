@@ -1,0 +1,37 @@
+{
+  "actions-checkout-test.yml": {
+    "disagreements": [],
+    "lab_accepted": true,
+    "lab_references": 30,
+    "stable_accepted": true,
+    "stable_references": 30
+  },
+  "astral-ruff-ci.yaml": {
+    "disagreements": [],
+    "lab_accepted": true,
+    "lab_references": 104,
+    "stable_accepted": true,
+    "stable_references": 104
+  },
+  "pallets-flask-tests.yaml": {
+    "disagreements": [],
+    "lab_accepted": true,
+    "lab_references": 7,
+    "stable_accepted": true,
+    "stable_references": 7
+  },
+  "python-cpython-build.yml": {
+    "disagreements": [
+      {
+        "class": "ACCEPTANCE_MISMATCH",
+        "expected": true,
+        "lab_accepted": false,
+        "stable_accepted": true
+      }
+    ],
+    "lab_accepted": false,
+    "lab_references": 26,
+    "stable_accepted": true,
+    "stable_references": 26
+  }
+}

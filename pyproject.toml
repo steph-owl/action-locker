@@ -9,22 +9,32 @@ description = "A lockfile for your GitHub Actions - and a locker for the ones yo
 requires-python = ">=3.9"
 license = { text = "Apache-2.0" }
 
-# Stdlib-only on purpose: this tool runs in CI and pre-commit environments
-# where every dependency is itself a supply-chain surface. The production
-# path (lock/verify/rewrite/vendor/update) imports nothing outside the
-# standard library.
+# No ambient runtime dependencies: the security-relevant YAML parser is a
+# pinned, hashed, pure-Python closure shipped inside the Action Locker
+# artifact. See third_party/ruamel.yaml and scripts/vendor_ruamel.py.
 dependencies = []
 
 [project.optional-dependencies]
-# The experimental `stable` parser backend (`scan --parser stable`) is the
-# only code that touches ruamel.yaml, and it imports it lazily — so this is
-# opt-in and never on the production path. Pinned exactly on purpose (a
-# parser is security-relevant); ADR 0001 PR 5 will vendor + hash it so the
-# `stable` path can become the default with no ambient install.
-stable = ["ruamel.yaml==0.19.1"]
+# Backward-compatible no-op for prerelease installation instructions. The
+# stable parser is now always included; this extra installs nothing ambient.
+stable = []
 
 [project.scripts]
 action-locker = "action_locker:main"
 
 [tool.setuptools]
 py-modules = ["action_locker"]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["_vendor*"]
+
+[tool.setuptools.package-data]
+"_vendor.ruamel.yaml" = [
+  "py.typed",
+  "LICENSE.action-locker-vendored",
+  "MANIFEST.action-locker.sha256",
+  "PROVENANCE.action-locker.json",
+  "UPSTREAM_METADATA.action-locker",
+]

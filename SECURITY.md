@@ -1,8 +1,10 @@
 # Security Policy
 
 action-locker is a security tool, so we hold it to the standard it holds
-others to. The entire tool is one stdlib-only Python file — we encourage
-you to read it before you run it.
+others to. The shipping artifact is self-contained: its pinned YAML parser,
+upstream license, provenance, and file hashes are included, with no ambient
+runtime package installation. We encourage you to inspect the closure before
+you run it.
 
 ## Reporting a vulnerability
 

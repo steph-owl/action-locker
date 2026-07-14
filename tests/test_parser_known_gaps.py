@@ -18,8 +18,6 @@ pin, not mere importability.
 
 import pytest
 
-pytest.importorskip("ruamel.yaml")
-
 import action_locker
 from action_locker import LegacyRegexBackend, StructuralYamlBackend
 

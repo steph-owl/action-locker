@@ -1,0 +1,10 @@
+{
+  "license": "MIT",
+  "package": "ruamel.yaml",
+  "runtime_dependencies": [],
+  "source_artifact": "ruamel_yaml-0.19.1-py3-none-any.whl",
+  "source_sha256": "27592957fedf6e0b62f281e96effd28043345e0e66001f97683aa9a40c667c93",
+  "source_url": "https://files.pythonhosted.org/packages/b8/0c/51f6841f1d84f404f92463fc2b1ba0da357ca1e3db6b7fbda26956c3b82a/ruamel_yaml-0.19.1-py3-none-any.whl",
+  "update_command": "python3 scripts/vendor_ruamel.py /path/to/ruamel_yaml-0.19.1-py3-none-any.whl",
+  "version": "0.19.1"
+}

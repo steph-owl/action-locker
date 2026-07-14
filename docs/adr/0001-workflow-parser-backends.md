@@ -1,7 +1,8 @@
 # ADR 0001: Structural workflow parsing with an experimental parser lab
 
-- **Status:** Proposed
+- **Status:** Accepted and implemented
 - **Date:** 2026-07-11
+- **Implemented:** 2026-07-14
 - **Owner:** Steph Prime
 - **Decision scope:** Discovery and rewriting of GitHub Actions `uses` references
 
@@ -22,7 +23,8 @@ Action Locker will support parser backends behind a common result model.
 
 ### Production backend: `stable`
 
-`stable` is a structural YAML parser intended to become the default security path. The first implementation will use a pinned, vendored `ruamel.yaml` distribution in YAML 1.2 round-trip mode.
+`stable` is the default structural YAML security path. It uses a pinned,
+vendored `ruamel.yaml` distribution in YAML 1.2 round-trip mode.
 
 The stable backend is authoritative for production decisions. It must:
 
@@ -100,7 +102,9 @@ action-locker verify --parser stable
 action-locker verify --parser compare
 ```
 
-`stable` becomes the default only after the migration gates in the implementation spec are met. `lab` always prints an experimental warning unless an environment variable intended for parser-lab CI suppresses it.
+`stable` is the default after satisfying the migration gates below. `lab`
+always prints an experimental warning unless an environment variable intended
+for parser-lab CI suppresses it.
 
 ## Normalized comparison identity
 
@@ -160,6 +164,15 @@ The structural backend may become the default when all of the following are true
 6. Unrelated block scalars, comments, quoting, and workflow content remain unchanged or changes are documented and snapshot-tested.
 7. The parser dependency is pinned, vendored, licensed, hashed, and updated through a documented process.
 8. Compare mode has run against the repository corpus and a representative external corpus with all disagreements triaged.
+
+All eight criteria were satisfied for promotion on 2026-07-14. The evidence
+is enforced by the offline test suite: fail-closed parser cases, exact-byte
+rewrite preservation and rollback tests, vendored dependency provenance and
+manifest checks, and the commit-pinned external corpus under
+`tests/fixtures/external_parser_corpus/`. That corpus contains 167 executable
+references across four public projects. Its one disagreement is reviewed and
+expected: lab/0 rejects a valid multi-line plain scalar in CPython's workflow,
+while stable accepts it and remains authoritative.
 
 ## References
 

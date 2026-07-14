@@ -2,6 +2,11 @@
 
 This document turns ADR 0001 into staged work. It is intentionally organized so each pull request leaves Action Locker usable and reviewable.
 
+**Implementation status (2026-07-14):** PR-equivalent stages 1 through 5 are
+complete and `stable` is the production default. The delivery sequence below
+is retained as design history. Optional Nix packaging and the PR 6+ research
+track remain future work; neither is an ADR promotion gate.
+
 ## One-sentence architecture
 
 Keep the Python policy engine, place workflow discovery behind a backend contract, make a structural parser authoritative, and evolve the existing regex scanner as a differential-tested lab implementation.

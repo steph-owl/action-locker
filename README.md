@@ -46,9 +46,11 @@ When you write `uses: some-org/cool-action@v1` in a workflow, you're trusting th
 **verify** it stays that way (including the content of vendored copies),
 and **vendor** a local snapshot of the actions you can't afford to lose.
 
-The whole tool is a single stdlib-only Python file. A supply-chain tool
-should not arrive with its own supply chain. You can read every line of
-`action_locker.py` before trusting it. Or ask a model to if that's your vibe.
+The tool ships as one self-contained, auditable artifact. Its
+security-relevant YAML parser is an exact, vendored pure-Python closure with
+recorded source, license, and file hashes — never an ambient runtime install
+whose behavior can change underneath you. Or ask a model to audit it if
+that's your vibe.
 
 ## How it works
 
@@ -239,16 +241,56 @@ But I've been using this pattern for a while now, and have been happy with it. T
 
 ## Install
 
-It's one file. 
+### Use it from any repository (no fork required)
+
+`action-locker` operates on the Git repository in your current working
+directory. The tool checkout and the repository being protected do not need
+to be related:
 
 ```bash
-# run from a clone (or just copy action_locker.py into your repo)
-python3 action_locker.py --help
+git clone https://github.com/steph-owl/action-locker.git /path/to/action-locker
+cd /path/to/your-existing-repo
+python3 /path/to/action-locker/action_locker.py lock
+python3 /path/to/action-locker/action_locker.py rewrite
+python3 /path/to/action-locker/action_locker.py verify
 ```
 
+For repeatable use, check out a reviewed Action Locker commit rather than
+leaving the tool checkout on a moving branch. You can also copy the complete
+release artifact into the consumer repository or install the pre-commit hook
+below. (`action_locker.py` and `_vendor/` belong together; copying only the
+script intentionally fails closed.)
+
 Requires Python 3.9+ and `git` (plus `curl`/`tar` for `vendor`). No pip
-packages, no lockfile for the lockfile tool. (There's a `pyproject.toml`,
-but only so the pre-commit hook can install it — `dependencies = []`.)
+dependencies or network access are needed for parsing and verification. The
+vendored parser closure is included in the checkout and package.
+
+### Keep a private or internal copy (mirror, don't fork)
+
+GitHub requires forks of a public repository to remain public. An
+organization that wants to audit and control its own private/internal Action
+Locker should create an empty repository and push an independent copy with
+the upstream history:
+
+```bash
+git clone https://github.com/steph-owl/action-locker.git
+cd action-locker
+git remote rename origin upstream
+git remote add origin git@github.com:YOUR-ORG/action-locker.git
+git push -u origin --all
+git push origin --tags
+```
+
+That repository is not in GitHub's fork network, so it may be private or
+internal. Pull reviewed updates from `upstream`, then consume the private copy
+as `YOUR-ORG/action-locker@<sha>`.
+
+Both CI integrations below are source-repository agnostic. The composite
+action executes the script under `GITHUB_ACTION_PATH`; the reusable workflow
+checks out `${{ job.workflow_repository }}` at `${{ job.workflow_sha }}`.
+For a private tool repository, allow the intended consumer repositories in
+its **Settings → Actions → General → Access** policy. Public consumer
+repositories cannot call a private action or reusable workflow.
 
 ## Usage
 
@@ -260,21 +302,31 @@ python3 action_locker.py verify    # the CI gate (offline)
 python3 action_locker.py update    # check upstream; --apply to accept
 ```
 
-### Experimental: `scan` (the parser lab)
+### Workflow parsing and the parser lab
 
 ```bash
+python3 action_locker.py scan --parser stable --format json
 python3 action_locker.py scan --parser lab --format json
+python3 action_locker.py scan --parser compare --format text
 ```
 
-A read-only, offline structural scan of your workflows: every `uses:` gets
-a semantic path (`jobs.build.steps[2].uses`), a kind (external action,
-reusable workflow, local, docker), and — crucially — anything the scanner
-*can't* confidently classify is reported as a rejection, never silently
-skipped. This is the first piece of the parser-backend work described in
-[ADR 0001](docs/adr/0001-workflow-parser-backends.md): the longtime regex
-scanner is now also an explicit, differential-testable backend (`lab/0`).
-Production `lock`/`verify`/`rewrite` behavior is unchanged; they don't use
-this path yet.
+The default `stable` backend performs a read-only, offline structural parse of
+each workflow. Every executable `uses:` gets a semantic path
+(`jobs.build.steps[2].uses`) and a kind (external action, reusable workflow,
+local, or Docker). `lock`, `verify`, `rewrite`, and `scan` all use this same
+normalized model by default. Malformed YAML, duplicate keys, multiple
+documents, and unsafe `uses` shapes fail closed.
+
+Stable uses the pinned `ruamel.yaml` source shipped in `_vendor/`, in YAML 1.2
+round-trip mode. Rewriting targets parser-provided scalar locations, validates
+the candidate bytes again, and atomically replaces files only after every
+postcondition passes. There is no optional parser install and no fallback to
+whatever happens to be in site-packages.
+
+The longtime scanner remains useful as the explicit experimental `lab/0`
+backend described in [ADR 0001](docs/adr/0001-workflow-parser-backends.md).
+Anything it cannot confidently classify is a rejection, never silently
+reported as zero references.
 
 `lab/0` deliberately models a *subset* of YAML and **fails closed** on the
 rest: multi-line (folded) scalars, flow collections that span lines,
@@ -282,21 +334,6 @@ quoted mapping keys, anchors/aliases/merge keys, tabs, and multiple
 documents all produce `accepted: false` with a diagnostic rather than a
 guess. That's the point — a scanner making a security claim must say "I
 can't read this" instead of silently reporting zero references.
-
-The `stable` backend reads full YAML through a pinned `ruamel.yaml` in
-1.2 round-trip mode, so it handles the constructs lab/0 refuses (anchors,
-flow collections, folded scalars) while walking only the two executable
-`uses` slots. It's an **optional** install — the default tool stays
-stdlib-only:
-
-```bash
-pip install 'action-locker[stable]'
-python3 action_locker.py scan --parser stable --format json
-```
-
-Without it, `scan --parser stable` reports the backend as unavailable
-(exit 4) rather than falling back — a scanner must answer with the engine
-you asked for.
 
 `compare` mode runs both backends over the same bytes and diffs their
 normalized results — `(kind, raw_target)` keyed by semantic path, never
@@ -388,7 +425,8 @@ that invocation.
 
 ## CI integration
 
-Simplest — the composite action, pinned by SHA:
+The consumer can be any existing repository; it does not need to fork or copy
+Action Locker. Simplest is the composite action, pinned by SHA:
 
 ```yaml
 jobs:
@@ -428,9 +466,10 @@ repos:
       - id: action-locker
 ```
 
-The hook runs `action-locker verify` whenever workflow files, the
-lockfile, or anything under `vendored-actions/` changes. It's offline and
-stdlib-only, so installs are instant. Run on demand with:
+The hook runs `action-locker verify` whenever workflow files, the lockfile, or
+anything under `vendored-actions/` changes. It's offline and has no ambient
+runtime dependencies, so installs stay quick and reproducible. Run on demand
+with:
 
 ```bash
 pre-commit run action-locker --all-files
@@ -455,9 +494,17 @@ false-confidence failure this workflow exists to prevent.
 
 ## Tests
 
+The pinned test toolchain requires Python 3.10+ (CI currently uses 3.12).
+The production CLI remains compatible with Python 3.9.
+
 ```bash
-python3 -m pytest            # offline unit tests (fixtures modeled on real production workflows)
-python3 -m pytest -m network # live integration tests (git ls-remote against GitHub)
+python3 -m venv .venv
+.venv/bin/pip install pytest==9.1.1
+.venv/bin/python scripts/vendor_ruamel.py --check
+.venv/bin/python scripts/update_external_parser_corpus.py --check
+.venv/bin/python -m pytest                    # offline unit tests, including stable
+.venv/bin/python action_locker.py scan --parser compare
+.venv/bin/python -m pytest -m network         # live integration tests (GitHub)
 ```
 
 ## Design principles
@@ -471,8 +518,8 @@ python3 -m pytest -m network # live integration tests (git ls-remote against Git
   being honest.
 - **Simple files, no magic.** The lockfile is JSON. The vendored actions
   are directories. `cat` and `ls` are your debuggers.
-- **One file, stdlib only.** The tool that pins your dependencies has no
-  dependencies of its own.
+- **One pinned, auditable artifact.** Runtime parser source, license,
+  provenance, and hashes ship together; no ambient package install is trusted.
 
 ## Hardening the locker (for org admins)
 

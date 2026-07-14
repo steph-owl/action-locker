@@ -1,9 +1,8 @@
 """Structural `stable` backend tests (ADR 0001 PR 2).
 
-`stable` is an OPTIONAL backend built on ruamel.yaml; the whole module is
-skipped when ruamel isn't installed, so the stdlib-only offline suite still
-passes without it. Everything here is offline — ruamel parses bytes from a
-path, no network.
+`stable` is the authoritative backend built on Action Locker's pinned,
+vendored ruamel.yaml closure. Everything here is offline — ruamel parses
+bytes from a path, with no network or ambient package dependency.
 
 Two things are under test: (1) stable's own structural contract — it walks
 only the two `uses` slots and fails closed on malformed containers on that
@@ -18,8 +17,6 @@ import sys
 from pathlib import Path
 
 import pytest
-
-pytest.importorskip("ruamel.yaml")
 
 import action_locker
 from action_locker import (

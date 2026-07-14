@@ -19,6 +19,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Tuple
 
+# The authoritative workflow parser is bundled as a pinned, hashed,
+# pure-Python closure. Put that private package root ahead of ambient
+# site-packages so parser semantics cannot change with the host environment.
+VENDORED_PYTHON_DIR = Path(__file__).resolve().parent / "_vendor"
+if VENDORED_PYTHON_DIR.is_dir():
+    _vendored_python = str(VENDORED_PYTHON_DIR)
+    if _vendored_python not in sys.path:
+        sys.path.insert(0, _vendored_python)
+
 __version__ = "0.9.0"
 
 
@@ -702,16 +711,13 @@ def tree_hash(root):
     return f"sha256:{digest}"
 
 
-# --- Parser lab (experimental; ADR 0001) ---
+# --- Workflow parser backends (ADR 0001) ---
 #
-# Workflow discovery is moving behind parser backends that can be compared
+# Workflow discovery is behind parser backends that can be compared
 # differentially (docs/adr/0001-workflow-parser-backends.md and
-# docs/parser-lab/IMPLEMENTATION.md). The legacy scanner above
-# (parse_workflows) remains THE production path for lock/verify/rewrite —
-# nothing below changes its behavior. The `lab/0` backend is that same
-# line-oriented idea made explicit and honest: it assigns semantic paths,
-# classifies reference kinds, excludes comments and block-scalar bodies,
-# and reports what it cannot classify instead of returning nothing.
+# docs/parser-lab/IMPLEMENTATION.md). The pinned structural backend is the
+# authoritative production path. `lab/0` keeps the old line-oriented idea as
+# an explicit, fail-closed diagnostic backend for differential testing.
 #
 # The safety rule for every backend: ambiguity or parser failure must
 # surface as diagnostics with accepted=False — never as an empty success.
@@ -1534,12 +1540,11 @@ class LegacyRegexBackend(WorkflowParserBackend):
     syntax it does not model safely. Scan-only: it never rewrites, never
     touches the network, and reads only the file it was given.
 
-    Known, intentional differences from the legacy parse_workflows scanner
-    (which production commands still use, unchanged): lab/0 excludes fake
-    `uses:` inside block scalars instead of matching them, returns local
-    and docker references as classified kinds instead of skipping them,
-    and does not pre-filter ref values (policy's job). Compare mode
-    (ADR 0001 PR 2) exists to measure exactly these gaps.
+    Known, intentional differences from the compatibility parse_workflows
+    scanner: lab/0 excludes fake `uses:` inside block scalars instead of
+    matching them, returns local and docker references as classified kinds
+    instead of skipping them, and does not pre-filter ref values (policy's
+    job). Compare mode exists to measure exactly these gaps.
     """
 
     name = "lab/0"
@@ -1573,12 +1578,8 @@ class LegacyRegexBackend(WorkflowParserBackend):
         )
 
 
-# The exact ruamel.yaml release the `stable` backend is developed and
-# tested against. It is an OPTIONAL dependency today (install with the
-# `stable` extra); the default lock/verify/rewrite path stays stdlib-only,
-# so a plain `pip install action-locker` still arrives with no supply
-# chain of its own. ADR 0001 PR 5 will vendor + hash this exact closure so
-# `stable` can become the production default without an ambient install.
+# The exact ruamel.yaml release vendored with the tool. The pin is checked at
+# runtime and its source wheel/provenance/file hashes live under third_party.
 STABLE_RUAMEL_PIN = "0.19.1"
 
 # Refuse to parse a workflow larger than this (bytes). Real workflows are a
@@ -1630,6 +1631,37 @@ def _stable_pos(container, key, want_value=True):
     if len(entry) >= 2:
         return entry[0] + 1, entry[1] + 1
     return None, None
+
+
+def _stable_uses_pos(container, key, source_lines):
+    """Value position for a `uses` key, correcting ruamel alias metadata.
+
+    For `uses: *alias`, ruamel records the value position at the anchor's
+    definition rather than at the executable alias slot. Rewriting that
+    reported position would mutate shared data outside `uses`. The mapping
+    key position still points at the real slot, so derive the alias token
+    column from that exact source line and keep the public location honest.
+    """
+    lc = getattr(container, "lc", None)
+    data = getattr(lc, "data", None) if lc is not None else None
+    try:
+        entry = data[key]
+    except (TypeError, KeyError, IndexError):
+        return _stable_pos(container, key)
+    if len(entry) >= 4 and entry[2] < entry[0] and source_lines:
+        key_line, key_col = entry[0], entry[1]
+        try:
+            line = source_lines[key_line]
+        except IndexError:
+            return _stable_pos(container, key)
+        colon = line.find(":", key_col)
+        if colon >= 0:
+            cursor = colon + 1
+            while cursor < len(line) and line[cursor] in " \t":
+                cursor += 1
+            if cursor < len(line) and line[cursor] == "*":
+                return key_line + 1, cursor + 1
+    return _stable_pos(container, key)
 
 
 class StructuralYamlBackend(WorkflowParserBackend):
@@ -1708,9 +1740,18 @@ class StructuralYamlBackend(WorkflowParserBackend):
                  f"workflow exceeds the {STABLE_MAX_BYTES}-byte scan limit")
             return ParseResult(self.name, (), tuple(diagnostics), False)
 
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            line, col = _yaml_error_pos(exc)
+            diag("YAML_PARSE_ERROR",
+                 f"invalid YAML: {exc.__class__.__name__}",
+                 line=line, column=col)
+            return ParseResult(self.name, (), tuple(diagnostics), False)
+
         yaml = self._loader()
         try:
-            documents = list(yaml.load_all(raw.decode("utf-8")))
+            documents = list(yaml.load_all(text))
         except DuplicateKeyError as exc:
             line, col = _yaml_error_pos(exc)
             diag("DUPLICATE_KEY",
@@ -1750,7 +1791,7 @@ class StructuralYamlBackend(WorkflowParserBackend):
             # An empty document has no jobs and therefore no `uses` to miss.
             return ParseResult(self.name, (), tuple(diagnostics), True)
 
-        _stable_walk(rel, root, references, diag)
+        _stable_walk(rel, root, references, diag, text.splitlines())
         return ParseResult(
             backend=self.name,
             references=tuple(sorted(references)),
@@ -1768,7 +1809,7 @@ def _yaml_error_pos(exc):
     return mark.line + 1, mark.column + 1
 
 
-def _stable_walk(rel, root, references, diag):
+def _stable_walk(rel, root, references, diag, source_lines=None):
     """Visit the two executable `uses` slots in a parsed workflow tree.
 
     Only jobs.<id>.uses and jobs.<id>.steps[<i>].uses are inspected. A node
@@ -1820,7 +1861,7 @@ def _stable_walk(rel, root, references, diag):
             continue
 
         if "uses" in job:
-            line, col = _stable_pos(job, "uses")
+            line, col = _stable_uses_pos(job, "uses", source_lines)
             _stable_emit(rel, f"jobs.{job_id}.uses", job["uses"], True,
                          line, col, references, diag)
 
@@ -1848,7 +1889,7 @@ def _stable_walk(rel, root, references, diag):
                          "is not a plain string", line=line, column=col)
                     continue
                 if "uses" in step:
-                    line, col = _stable_pos(step, "uses")
+                    line, col = _stable_uses_pos(step, "uses", source_lines)
                     _stable_emit(
                         rel, f"jobs.{job_id}.steps[{idx}].uses", step["uses"],
                         False, line, col, references, diag)
@@ -1892,23 +1933,73 @@ def _stable_emit(rel, path, value, job_level, line, col, references, diag):
 PARSER_BACKENDS = {"lab": LegacyRegexBackend}
 
 
+def _vendored_parser_integrity_valid(vendor_root=None, artifact_root=None):
+    """Verify the exact bundled parser closure before importing any of it."""
+    vendor_root = Path(vendor_root or (VENDORED_PYTHON_DIR / "ruamel" / "yaml"))
+    artifact_root = Path(artifact_root or VENDORED_PYTHON_DIR.parent)
+    manifest_path = vendor_root / "MANIFEST.action-locker.sha256"
+    try:
+        entries = {}
+        for line in manifest_path.read_text().splitlines():
+            digest, separator, relative = line.partition("  ")
+            if (
+                separator != "  "
+                or not re.fullmatch(r"[0-9a-f]{64}", digest)
+                or relative in entries
+                or not relative.startswith("_vendor/ruamel/yaml/")
+            ):
+                return False
+            path = artifact_root / relative
+            path.resolve().relative_to(vendor_root.resolve())
+            entries[relative] = digest
+
+        actual_paths = set()
+        for path in vendor_root.rglob("*"):
+            if path.is_symlink():
+                return False
+            if (
+                not path.is_file()
+                or "__pycache__" in path.parts
+                or path.suffix == ".pyc"
+                or path == manifest_path
+            ):
+                continue
+            relative = path.relative_to(artifact_root).as_posix()
+            actual_paths.add(relative)
+            if entries.get(relative) != hashlib.sha256(path.read_bytes()).hexdigest():
+                return False
+        return actual_paths == set(entries)
+    except (OSError, UnicodeDecodeError, ValueError):
+        return False
+
+
 def stable_backend_available():
-    """True when ruamel.yaml is importable AND is the exact pinned release.
+    """True when the bundled ruamel.yaml is the exact pinned release.
 
     The pin is part of the security claim, not a suggestion: `stable` is
     developed and differential-tested against one specific parser closure
     (STABLE_RUAMEL_PIN), and a different ruamel release can legitimately
     resolve scalars or duplicate keys differently. Running against an
     unpinned version would silently change what the authoritative backend
-    accepts. The import is lazy and any failure — missing OR mismatched —
-    is reported as `backend unavailable` (scan exit code 4), never a crash
-    and never a silent fall back to another backend or another version.
+    accepts. Any missing, mismatched, or ambient copy is reported as
+    `backend unavailable` (scan exit code 4), never a crash and never a
+    silent fall back to another backend or another version.
     """
+    if not _vendored_parser_integrity_valid():
+        return False
     try:
         import ruamel.yaml
     except ImportError:
         return False
-    return getattr(ruamel.yaml, "__version__", None) == STABLE_RUAMEL_PIN
+    if getattr(ruamel.yaml, "__version__", None) != STABLE_RUAMEL_PIN:
+        return False
+    try:
+        Path(ruamel.yaml.__file__).resolve().relative_to(
+            VENDORED_PYTHON_DIR.resolve()
+        )
+    except (AttributeError, ValueError):
+        return False
+    return True
 
 
 # Disagreement classes, ordered most-actionable first for display.
@@ -2025,11 +2116,165 @@ def _diagnostic_as_json(diagnostic):
     }
 
 
+def _command_parser_name(args, default="stable"):
+    """Resolve a production command's parser without silent fallback.
+
+    Migration order is explicit CLI, ACTION_LOCKER_PARSER, then the command
+    default. `legacy` remains an internal test/compatibility path and is never
+    accepted from user configuration; the public parser names are the ADR
+    backends. An unknown environment value is configuration failure, not an
+    excuse to run a different scanner.
+    """
+    explicit = getattr(args, "parser_backend", None)
+    configured = explicit or os.environ.get("ACTION_LOCKER_PARSER")
+    if configured is None:
+        return default
+    if configured not in ("lab", "stable", "compare"):
+        print(
+            f"Error: unknown parser backend `{configured}` "
+            "(from --parser or ACTION_LOCKER_PARSER)",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    return configured
+
+
+def _workflow_paths(repo_root):
+    """Return deterministic workflow paths selected outside all backends."""
+    workflows_dir = Path(repo_root) / ".github" / "workflows"
+    if not workflows_dir.exists():
+        print(f"No workflows found at {workflows_dir}", file=sys.stderr)
+        return []
+    return (
+        sorted(workflows_dir.glob("*.yml"))
+        + sorted(workflows_dir.glob("*.yaml"))
+    )
+
+
+def _print_parse_rejection(result):
+    """Print typed parser diagnostics without echoing workflow contents."""
+    for diagnostic in result.diagnostics:
+        if diagnostic.severity != "error":
+            continue
+        position = ""
+        if diagnostic.line is not None:
+            position = f":{diagnostic.line}"
+            if diagnostic.column is not None:
+                position += f":{diagnostic.column}"
+        print(
+            f"Error: {diagnostic.file}{position}: {diagnostic.code}: "
+            f"{diagnostic.message}",
+            file=sys.stderr,
+        )
+
+
+def _parse_for_production(repo_root, parser_name):
+    """Parse every workflow before a production command can act.
+
+    `stable` is authoritative. `compare` requires semantic agreement with
+    lab/0 before returning stable results. Any rejected file or disagreement
+    aborts the whole command before lockfile/workflow mutation, so ambiguity
+    can never become an incomplete successful discovery result.
+    """
+    paths = _workflow_paths(repo_root)
+    if parser_name in ("stable", "compare") and not stable_backend_available():
+        print(
+            f"Error: bundled parser backend `{parser_name}` is missing or "
+            f"does not match ruamel.yaml =={STABLE_RUAMEL_PIN}; reinstall "
+            "the exact Action Locker artifact",
+            file=sys.stderr,
+        )
+        sys.exit(4)
+
+    if parser_name == "lab":
+        backend = LegacyRegexBackend()
+        if not os.environ.get("ACTION_LOCKER_PARSER_LAB_CI"):
+            print(
+                "note: `lab/0` is experimental and may reject YAML outside "
+                "its declared subset",
+                file=sys.stderr,
+            )
+        results = [backend.parse_file(repo_root, path) for path in paths]
+    elif parser_name == "stable":
+        backend = StructuralYamlBackend()
+        results = [backend.parse_file(repo_root, path) for path in paths]
+    else:
+        stable = StructuralYamlBackend()
+        lab = LegacyRegexBackend()
+        results = []
+        disagreed = False
+        for path in paths:
+            stable_result = stable.parse_file(repo_root, path)
+            lab_result = lab.parse_file(repo_root, path)
+            disagreements = _compare_file(stable_result, lab_result)
+            if disagreements:
+                disagreed = True
+                rel = path.relative_to(repo_root).as_posix()
+                print(f"Error: PARSER DISAGREEMENT {rel}", file=sys.stderr)
+                for disagreement in disagreements:
+                    for line in _format_disagreement_lines(disagreement):
+                        print(line, file=sys.stderr)
+            results.append(stable_result)
+        if disagreed:
+            sys.exit(3)
+
+    rejected = [result for result in results if not result.accepted]
+    if rejected:
+        for result in rejected:
+            _print_parse_rejection(result)
+        sys.exit(1)
+    return results
+
+
+def discover_workflow_actions(repo_root, args, default="stable"):
+    """Return the compatibility action/location map from a chosen backend.
+
+    Local actions and docker images are structurally classified but are not
+    lockfile subjects. An external/reusable target that cannot be split into
+    action/ref is a policy error: production commands must not silently omit
+    an executable `uses` slot that the parser found.
+    """
+    parser_name = _command_parser_name(args, default=default)
+    if parser_name == "legacy":
+        return parse_workflows(repo_root)
+
+    results = _parse_for_production(repo_root, parser_name)
+    actions = {}
+    invalid = []
+    for result in results:
+        for reference in result.references:
+            if reference.kind == "docker-image":
+                print(
+                    f"Note: skipping docker:// ref "
+                    f"({reference.file}:{reference.line}) — not managed by "
+                    "action-locker; pin images by digest",
+                    file=sys.stderr,
+                )
+                continue
+            if reference.kind == "local-action":
+                continue
+            if reference.action is None or reference.ref is None:
+                invalid.append(reference)
+                continue
+            key = f"{reference.action}@{reference.ref}"
+            actions.setdefault(key, []).append((reference.file, reference.line))
+
+    if invalid:
+        for reference in invalid:
+            print(
+                f"Error: {reference.file}:{reference.line}:{reference.column}: "
+                f"INVALID_USES_TARGET: `{reference.raw_target}`",
+                file=sys.stderr,
+            )
+        sys.exit(1)
+    return actions
+
+
 # --- Commands ---
 
 def cmd_lock(args, repo_root):
     """Resolve all action refs to SHAs and write lockfile."""
-    actions = parse_workflows(repo_root)
+    actions = discover_workflow_actions(repo_root, args)
     if not actions:
         print("No actions found in workflows.")
         return
@@ -2210,7 +2455,7 @@ def cmd_lock(args, repo_root):
 
 def cmd_verify(args, repo_root):
     """Verify all workflow refs match the lockfile."""
-    actions = parse_workflows(repo_root)
+    actions = discover_workflow_actions(repo_root, args)
     lockdata = load_lockfile(repo_root)
 
     if not lockdata["locked"]:
@@ -2607,39 +2852,302 @@ def cmd_update(args, repo_root):
             print("\nRun `action-locker update --apply` to apply these updates.")
 
 
-def cmd_rewrite(args, repo_root):
-    """Rewrite workflow files to use pinned SHAs from the lockfile."""
-    lockdata = load_lockfile(repo_root)
-    if not lockdata["locked"]:
-        print("No lockfile found. Run `action-locker lock` first.", file=sys.stderr)
-        sys.exit(1)
+class StructuralRewriteError(Exception):
+    """A fail-closed structural rewrite refusal."""
 
-    # Build a lookup: action@mutable_ref -> sha. The pinned comment shows
-    # `selected` when the entry was held back — the comment tells the truth
-    # about what you actually got (and it's what Dependabot reads).
+
+def _rewrite_ref_map(lockdata):
+    """Mutable action/ref -> (resolved SHA, truthful display tag)."""
     ref_map = {}
     for action_ref, entry in lockdata["locked"].items():
         action, ref = action_ref.rsplit("@", 1)
         if not is_sha(ref):
-            ref_map[(action, ref)] = (entry["resolved"], entry.get("selected") or ref)
+            ref_map[(action, ref)] = (
+                entry["resolved"], entry.get("selected") or ref
+            )
+    return ref_map
 
+
+def _line_start_offsets(text):
+    """Character offsets for each one-based parser line."""
+    offsets = [0]
+    offsets.extend(match.end() for match in re.finditer("\n", text))
+    return offsets
+
+
+def _source_scalar_span(text, reference):
+    """Locate a scalar only from its structural parser line/column.
+
+    Supports plain/quoted scalars, flow delimiters, inline anchors, and
+    aliases. It never searches unrelated lines for matching target text.
+    """
+    if reference.line < 1 or reference.column < 1:
+        raise StructuralRewriteError(
+            f"{reference.file}:{reference.semantic_path} has no source position"
+        )
+    offsets = _line_start_offsets(text)
+    if reference.line > len(offsets):
+        raise StructuralRewriteError("parser source line is out of range")
+    start = offsets[reference.line - 1] + reference.column - 1
+    if start >= len(text):
+        raise StructuralRewriteError("parser source column is out of range")
+
+    cursor = start
+    if text[cursor] == "&":
+        cursor += 1
+        while cursor < len(text) and text[cursor] not in " \t\r\n,[]{}#":
+            cursor += 1
+        if cursor == start + 1:
+            raise StructuralRewriteError("empty YAML anchor at uses value")
+        while cursor < len(text) and text[cursor] in " \t":
+            cursor += 1
+        if cursor >= len(text):
+            raise StructuralRewriteError("anchor has no scalar value")
+
+    value_start = cursor
+    if text[cursor] == "*":
+        cursor += 1
+        while cursor < len(text) and text[cursor] not in " \t\r\n,[]{}#":
+            cursor += 1
+        return start, cursor, "alias", value_start
+
+    if text[cursor] == "'":
+        cursor += 1
+        while cursor < len(text):
+            if text[cursor] == "'":
+                if cursor + 1 < len(text) and text[cursor + 1] == "'":
+                    cursor += 2
+                    continue
+                return start, cursor + 1, "single", value_start
+            cursor += 1
+        raise StructuralRewriteError("unterminated single-quoted uses scalar")
+
+    if text[cursor] == '"':
+        cursor += 1
+        while cursor < len(text):
+            if text[cursor] == "\\":
+                cursor += 2
+                continue
+            if cursor < len(text) and text[cursor] == '"':
+                return start, cursor + 1, "double", value_start
+            cursor += 1
+        raise StructuralRewriteError("unterminated double-quoted uses scalar")
+
+    while cursor < len(text):
+        char = text[cursor]
+        if char in "\r\n,}]":
+            break
+        if char == "#" and cursor > value_start and text[cursor - 1] in " \t":
+            break
+        cursor += 1
+    end = cursor
+    while end > value_start and text[end - 1] in " \t":
+        end -= 1
+    if end == value_start:
+        raise StructuralRewriteError("empty uses scalar")
+    return start, end, "plain", value_start
+
+
+def _validate_source_scalar(text, span, reference):
+    """Cross-check a located token against the parser's semantic value."""
+    _, end, style, value_start = span
+    if style == "alias":
+        return
+    token = text[value_start:end]
+    try:
+        parsed = StructuralYamlBackend()._loader().load("value: " + token + "\n")
+        decoded = parsed["value"]
+    except Exception as exc:
+        raise StructuralRewriteError(
+            f"cannot validate source scalar: {exc.__class__.__name__}"
+        ) from exc
+    if not isinstance(decoded, str) or str(decoded) != reference.raw_target:
+        raise StructuralRewriteError(
+            f"source span for {reference.semantic_path} does not match "
+            "the structural parse"
+        )
+
+
+def _scalar_replacement(text, span, target, tag):
+    """Build a style-preserving replacement and safe optional tag comment."""
+    start, end, style, value_start = span
+    prefix = text[start:value_start] if style != "alias" else ""
+    if style == "single":
+        scalar = "'" + target.replace("'", "''") + "'"
+    elif style == "double":
+        escaped = target.replace("\\", "\\\\").replace('"', '\\"')
+        scalar = '"' + escaped + '"'
+    else:
+        scalar = target
+    replacement = prefix + scalar
+
+    line_end = text.find("\n", end)
+    if line_end == -1:
+        line_end = len(text)
+    content_end = (
+        line_end - 1
+        if line_end > end and text[line_end - 1] == "\r"
+        else line_end
+    )
+    # Existing comments remain byte-identical. A flow delimiter means an EOL
+    # comment would swallow executable YAML, so the lockfile carries the tag.
+    if not text[end:content_end].strip():
+        replacement += f"  # {tag}"
+    return start, end, replacement
+
+
+def _candidate_rewrite_bytes(original, result, ref_map):
+    """Prepare one workflow rewrite entirely in memory."""
+    bom = original.startswith(b"\xef\xbb\xbf")
+    try:
+        text = original.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise StructuralRewriteError("workflow is not UTF-8") from exc
+
+    edits = {}
+    expected = {}
+    for reference in result.references:
+        if reference.action is None or reference.ref is None:
+            continue
+        replacement = ref_map.get((reference.action, reference.ref))
+        if replacement is None:
+            continue
+        sha, tag = replacement
+        target = f"{reference.action}@{sha}"
+        span = _source_scalar_span(text, reference)
+        _validate_source_scalar(text, span, reference)
+        start, end, content = _scalar_replacement(text, span, target, tag)
+        key = (start, end)
+        if key in edits and edits[key] != content:
+            raise StructuralRewriteError("conflicting rewrites share a source span")
+        edits[key] = content
+        expected[reference.semantic_path] = target
+
+    for (start, end), replacement in sorted(edits.items(), reverse=True):
+        text = text[:start] + replacement + text[end:]
+    candidate = text.encode("utf-8")
+    if bom:
+        candidate = b"\xef\xbb\xbf" + candidate
+    return candidate, expected
+
+
+def _validate_rewrite_candidate(repo_root, path, original_result, candidate,
+                                expected, compare=False):
+    """Reparse candidate bytes and enforce semantic postconditions."""
+    with tempfile.TemporaryDirectory(dir=path.parent) as tmpdir:
+        candidate_path = Path(tmpdir) / path.name
+        candidate_path.write_bytes(candidate)
+        stable_result = StructuralYamlBackend().parse_file(repo_root, candidate_path)
+        if not stable_result.accepted:
+            codes = ", ".join(d.code for d in stable_result.diagnostics)
+            raise StructuralRewriteError(
+                f"candidate for {path.name} failed stable reparse ({codes})"
+            )
+        before = {r.semantic_path: r for r in original_result.references}
+        after = {r.semantic_path: r for r in stable_result.references}
+        if set(before) != set(after):
+            raise StructuralRewriteError(
+                f"candidate for {path.name} changed executable uses paths"
+            )
+        for semantic_path, old in before.items():
+            new = after[semantic_path]
+            wanted = expected.get(semantic_path, old.raw_target)
+            if new.raw_target != wanted or new.kind != old.kind:
+                raise StructuralRewriteError(
+                    f"candidate postcondition failed at {semantic_path}"
+                )
+        if compare:
+            lab_result = LegacyRegexBackend().parse_file(repo_root, candidate_path)
+            if _compare_file(stable_result, lab_result):
+                raise StructuralRewriteError(
+                    f"candidate for {path.name} disagrees with lab/0"
+                )
+
+
+def _atomic_write_bytes(path, content):
+    """Replace one file atomically from a same-directory temporary file."""
+    path = Path(path)
+    mode = path.stat().st_mode
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", dir=path.parent, prefix=f".{path.name}.",
+            suffix=".action-locker.tmp", delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+        temporary = None
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _cmd_rewrite_structural(repo_root, lockdata, parser_name):
+    """Source-aware, postcondition-checked structural rewrite."""
+    ref_map = _rewrite_ref_map(lockdata)
     if not ref_map:
         print("No mutable refs to rewrite (everything is already pinned).")
         return
+    paths = _workflow_paths(repo_root)
+    results = _parse_for_production(repo_root, parser_name)
+    prepared = []
+    rewrites = 0
+    try:
+        for path, result in zip(paths, results):
+            original = path.read_bytes()
+            candidate, expected = _candidate_rewrite_bytes(original, result, ref_map)
+            if candidate == original:
+                continue
+            _validate_rewrite_candidate(
+                repo_root, path, result, candidate, expected,
+                compare=parser_name == "compare",
+            )
+            prepared.append((path, original, candidate))
+            rewrites += len(expected)
+    except (OSError, StructuralRewriteError) as exc:
+        print(f"Error: structural rewrite aborted: {exc}", file=sys.stderr)
+        sys.exit(1)
 
+    committed = []
+    try:
+        for path, original, candidate in prepared:
+            _atomic_write_bytes(path, candidate)
+            committed.append((path, original))
+            print(f"  Rewrote {path.relative_to(repo_root)}")
+    except OSError as exc:
+        for path, original in reversed(committed):
+            try:
+                _atomic_write_bytes(path, original)
+            except OSError:
+                pass
+        print(f"Error: atomic rewrite failed: {exc}", file=sys.stderr)
+        sys.exit(1)
+    print(f"\n{rewrites} reference(s) rewritten to pinned SHAs.")
+
+
+def _cmd_rewrite_legacy(repo_root, lockdata):
+    """Private compatibility implementation; never user-selectable."""
+    ref_map = _rewrite_ref_map(lockdata)
+    if not ref_map:
+        print("No mutable refs to rewrite (everything is already pinned).")
+        return
     workflows_dir = repo_root / ".github" / "workflows"
     rewrites = 0
-
     for wf_file in sorted(workflows_dir.glob("*.yml")) + sorted(workflows_dir.glob("*.yaml")):
         lines = wf_file.read_text().splitlines(keepends=True)
         modified = False
-
         for i, line in enumerate(lines):
             match = USES_PATTERN.search(line)
             if match:
                 action = match.group("action")
                 ref = match.group("ref")
-
                 if (action, ref) in ref_map:
                     sha, tag = ref_map[(action, ref)]
                     old = f"{action}@{ref}"
@@ -2647,20 +3155,33 @@ def cmd_rewrite(args, repo_root):
                     lines[i] = line.replace(old, new)
                     modified = True
                     rewrites += 1
-
         if modified:
             wf_file.write_text("".join(lines))
             print(f"  Rewrote {wf_file.relative_to(repo_root)}")
-
     print(f"\n{rewrites} reference(s) rewritten to pinned SHAs.")
 
 
+def cmd_rewrite(args, repo_root):
+    """Rewrite workflows through the selected parser mutation boundary."""
+    lockdata = load_lockfile(repo_root)
+    if not lockdata["locked"]:
+        print("No lockfile found. Run `action-locker lock` first.", file=sys.stderr)
+        sys.exit(1)
+    parser_name = _command_parser_name(args, default="stable")
+    if parser_name == "lab":
+        print("Error: parser backend `lab` is scan-only", file=sys.stderr)
+        sys.exit(2)
+    if parser_name == "legacy":
+        return _cmd_rewrite_legacy(repo_root, lockdata)
+    return _cmd_rewrite_structural(repo_root, lockdata, parser_name)
+
+
 def cmd_scan(args, repo_root):
-    """Structurally scan workflows with an experimental parser backend.
+    """Structurally scan workflows with a selected parser backend.
 
     Read-only and fully offline: parses workflow bytes, prints results,
-    touches nothing. Production commands (lock/verify/rewrite) do NOT use
-    this path yet — see ADR 0001.
+    touches nothing. The same stable backend is authoritative for production
+    commands; lab and compare remain explicit diagnostic modes.
 
     Exit codes (docs/parser-lab/IMPLEMENTATION.md): 0 = parsed cleanly;
     1 = a file was rejected (parser uncertainty is an error, never an
@@ -2670,7 +3191,7 @@ def cmd_scan(args, repo_root):
     requested = (
         args.parser_backend
         or os.environ.get("ACTION_LOCKER_PARSER")
-        or "lab"
+        or "stable"
     )
     if requested not in ("lab", "stable", "compare"):
         print(
@@ -2685,28 +3206,26 @@ def cmd_scan(args, repo_root):
         return
 
     # Resolve the requested backend. `backend unavailable` (exit 4) is
-    # distinct from `rejected` (exit 1): a missing optional dependency must
+    # distinct from `rejected` (exit 1): a missing bundled dependency must
     # never make the scanner silently answer with a different engine.
     if requested == "lab":
         backend = LegacyRegexBackend()
     else:  # stable
         if not stable_backend_available():
             print(
-                "Error: parser backend `stable` requires ruamel.yaml "
-                f"=={STABLE_RUAMEL_PIN} exactly, which is not installed "
-                "(a different installed version also counts as unavailable). "
-                "Install the optional extra: pip install 'action-locker[stable]'",
+                "Error: bundled parser backend `stable` is missing or does "
+                f"not match ruamel.yaml =={STABLE_RUAMEL_PIN}; reinstall the "
+                "exact Action Locker artifact",
                 file=sys.stderr,
             )
             sys.exit(4)
         backend = StructuralYamlBackend()
 
-    if not os.environ.get("ACTION_LOCKER_PARSER_LAB_CI"):
+    if requested == "lab" and not os.environ.get("ACTION_LOCKER_PARSER_LAB_CI"):
         print(
             yellow(
                 f"note: `{backend.name}` is an experimental parser backend; "
-                f"production commands still use the built-in scanner "
-                f"(ADR 0001). Set ACTION_LOCKER_PARSER_LAB_CI=1 to silence."
+                "set ACTION_LOCKER_PARSER_LAB_CI=1 to silence."
             ),
             file=sys.stderr,
         )
@@ -2775,8 +3294,8 @@ def _cmd_scan_compare(args, repo_root):
     same bytes and diff their normalized results.
 
     `stable` is authoritative; this measures where the experimental lab
-    agrees with it (ADR 0001). Read-only and offline. Requires ruamel
-    (stable) — missing it is `backend unavailable` (exit 4), never a
+    agrees with it (ADR 0001). Read-only and offline. Requires the bundled
+    stable parser — missing it is `backend unavailable` (exit 4), never a
     single-backend fallback.
 
     Exit codes: 3 = the backends disagreed on some file; 1 = they agreed
@@ -2788,10 +3307,9 @@ def _cmd_scan_compare(args, repo_root):
     """
     if not stable_backend_available():
         print(
-            "Error: parser backend `compare` requires the `stable` backend, "
-            f"which needs ruamel.yaml =={STABLE_RUAMEL_PIN} exactly "
-            "(a different installed version also counts as unavailable). "
-            "Install the optional extra: pip install 'action-locker[stable]'",
+            "Error: bundled parser backend `compare` is missing or does not "
+            f"match ruamel.yaml =={STABLE_RUAMEL_PIN}; reinstall the exact "
+            "Action Locker artifact",
             file=sys.stderr,
         )
         sys.exit(4)
@@ -2801,9 +3319,9 @@ def _cmd_scan_compare(args, repo_root):
     if not os.environ.get("ACTION_LOCKER_PARSER_LAB_CI"):
         print(
             yellow(
-                "note: `compare` runs experimental parser backends "
-                f"(`{lab.name}` vs authoritative `{stable.name}`); production "
-                "commands still use the built-in scanner (ADR 0001). "
+                "note: `compare` runs the experimental "
+                f"`{lab.name}` backend against authoritative `{stable.name}`; "
+                "explicit compare requires semantic agreement. "
                 "Set ACTION_LOCKER_PARSER_LAB_CI=1 to silence."
             ),
             file=sys.stderr,
@@ -2952,9 +3470,21 @@ def main():
         "--no-fallback", action="store_true",
         help="Never hold back to an older release; refuse fresh targets outright",
     )
+    lock_parser.add_argument(
+        "--parser", dest="parser_backend",
+        choices=["lab", "stable", "compare"], default=None,
+        help="workflow parser (default: ACTION_LOCKER_PARSER, else stable)",
+    )
 
     # verify
-    subparsers.add_parser("verify", help="Check that all workflow refs match the lockfile")
+    verify_parser = subparsers.add_parser(
+        "verify", help="Check that all workflow refs match the lockfile"
+    )
+    verify_parser.add_argument(
+        "--parser", dest="parser_backend",
+        choices=["lab", "stable", "compare"], default=None,
+        help="workflow parser (default: ACTION_LOCKER_PARSER, else stable)",
+    )
 
     # vendor
     vendor_parser = subparsers.add_parser("vendor", help="Download locked actions into vendor directory")
@@ -2978,17 +3508,24 @@ def main():
     )
 
     # rewrite
-    subparsers.add_parser("rewrite", help="Rewrite workflow files to use pinned SHAs from lockfile")
+    rewrite_parser = subparsers.add_parser(
+        "rewrite", help="Rewrite workflow files to use pinned SHAs from lockfile"
+    )
+    rewrite_parser.add_argument(
+        "--parser", dest="parser_backend",
+        choices=["lab", "stable", "compare"], default=None,
+        help="rewrite parser (stable or compare; default: ACTION_LOCKER_PARSER, else stable)",
+    )
 
-    # scan (experimental parser lab — ADR 0001)
+    # scan (workflow parser diagnostics — ADR 0001)
     scan_parser = subparsers.add_parser(
         "scan",
-        help="(experimental) structurally scan workflows for `uses` references",
+        help="structurally scan workflows for `uses` references",
     )
     scan_parser.add_argument(
         "--parser", dest="parser_backend",
         choices=["lab", "stable", "compare"], default=None,
-        help="parser backend (default: ACTION_LOCKER_PARSER env var, else `lab`)",
+        help="parser backend (default: ACTION_LOCKER_PARSER env var, else `stable`)",
     )
     scan_parser.add_argument(
         "--format", choices=["text", "json"], default="text",
