@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "sources": [
+    {
+      "commit": "e8d4307400f9427dba7cb98e488d6ab85f1cec5f",
+      "file": "actions-checkout-test.yml",
+      "license": "MIT",
+      "license_url": "https://github.com/actions/checkout/blob/e8d4307400f9427dba7cb98e488d6ab85f1cec5f/LICENSE",
+      "path": ".github/workflows/test.yml",
+      "repository": "actions/checkout",
+      "sha256": "cc1cbdd36bae909c4f30f529505c860365156c3a9606b179729549631fc7d593",
+      "source_url": "https://raw.githubusercontent.com/actions/checkout/e8d4307400f9427dba7cb98e488d6ab85f1cec5f/.github/workflows/test.yml"
+    },
+    {
+      "commit": "36e4a824f340fdee7ed50937ba8e7f6bc7d17f81",
+      "file": "pallets-flask-tests.yaml",
+      "license": "BSD-3-Clause",
+      "license_url": "https://github.com/pallets/flask/blob/36e4a824f340fdee7ed50937ba8e7f6bc7d17f81/LICENSE.txt",
+      "path": ".github/workflows/tests.yaml",
+      "repository": "pallets/flask",
+      "sha256": "fefc4362b9823c261594a05c7919140c2e312eecee84c4dd10095dbdd00a514b",
+      "source_url": "https://raw.githubusercontent.com/pallets/flask/36e4a824f340fdee7ed50937ba8e7f6bc7d17f81/.github/workflows/tests.yaml"
+    },
+    {
+      "commit": "c84e8eb7ba2ab68a7a61244d7411d0b855f90bd4",
+      "file": "astral-ruff-ci.yaml",
+      "license": "MIT",
+      "license_url": "https://github.com/astral-sh/ruff/blob/c84e8eb7ba2ab68a7a61244d7411d0b855f90bd4/LICENSE",
+      "path": ".github/workflows/ci.yaml",
+      "repository": "astral-sh/ruff",
+      "sha256": "72d2160bdf686462e4c50e89555a13091fc9f03d82da7aa554f5f10d697795f0",
+      "source_url": "https://raw.githubusercontent.com/astral-sh/ruff/c84e8eb7ba2ab68a7a61244d7411d0b855f90bd4/.github/workflows/ci.yaml"
+    },
+    {
+      "commit": "ba289460069fbdb5b035b48c5c0ba667d42a7ab9",
+      "file": "python-cpython-build.yml",
+      "license": "Python-2.0",
+      "license_url": "https://github.com/python/cpython/blob/ba289460069fbdb5b035b48c5c0ba667d42a7ab9/LICENSE",
+      "path": ".github/workflows/build.yml",
+      "repository": "python/cpython",
+      "sha256": "a2b4bee27effc3f96f0540a7d63117d1111384e31e23138025b9c904e4ed26c8",
+      "source_url": "https://raw.githubusercontent.com/python/cpython/ba289460069fbdb5b035b48c5c0ba667d42a7ab9/.github/workflows/build.yml"
+    }
+  ]
+}

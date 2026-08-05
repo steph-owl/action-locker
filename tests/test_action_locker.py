@@ -15,6 +15,7 @@ from action_locker import (
     cmd_update,
     cmd_vendor,
     cmd_verify,
+    find_repo_root,
     is_sha,
     is_trusted,
     load_lockfile,
@@ -95,6 +96,17 @@ class TestParseWorkflows:
 # --- small helpers ---
 
 class TestHelpers:
+    def test_find_repo_root_uses_consumer_working_directory(
+        self, tmp_path, monkeypatch
+    ):
+        """The tool may live elsewhere; repository discovery starts at cwd."""
+        (tmp_path / ".github" / "workflows").mkdir(parents=True)
+        nested = tmp_path / "src" / "package"
+        nested.mkdir(parents=True)
+        monkeypatch.chdir(nested)
+
+        assert find_repo_root() == tmp_path
+
     def test_is_sha(self):
         assert is_sha(SHA_CREATE_TAG)
         assert not is_sha("v4")

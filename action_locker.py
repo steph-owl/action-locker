@@ -14,8 +14,19 @@ import subprocess
 import sys
 import tempfile
 import shutil
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional, Tuple
+
+# The authoritative workflow parser is bundled as a pinned, hashed,
+# pure-Python closure. Put that private package root ahead of ambient
+# site-packages so parser semantics cannot change with the host environment.
+VENDORED_PYTHON_DIR = Path(__file__).resolve().parent / "_vendor"
+if VENDORED_PYTHON_DIR.is_dir():
+    _vendored_python = str(VENDORED_PYTHON_DIR)
+    if _vendored_python not in sys.path:
+        sys.path.insert(0, _vendored_python)
 
 __version__ = "0.9.0"
 
@@ -700,11 +711,1570 @@ def tree_hash(root):
     return f"sha256:{digest}"
 
 
+# --- Workflow parser backends (ADR 0001) ---
+#
+# Workflow discovery is behind parser backends that can be compared
+# differentially (docs/adr/0001-workflow-parser-backends.md and
+# docs/parser-lab/IMPLEMENTATION.md). The pinned structural backend is the
+# authoritative production path. `lab/0` keeps the old line-oriented idea as
+# an explicit, fail-closed diagnostic backend for differential testing.
+#
+# The safety rule for every backend: ambiguity or parser failure must
+# surface as diagnostics with accepted=False — never as an empty success.
+
+PARSER_LAB_SCHEMA_VERSION = 1
+
+REFERENCE_KINDS = (
+    "external-action",
+    "reusable-workflow",
+    "local-action",
+    "docker-image",
+)
+
+
+@dataclass(frozen=True, order=True)
+class WorkflowReference:
+    """One executable `uses:` slot in a workflow file.
+
+    `semantic_path` (jobs.<job_id>.uses or jobs.<job_id>.steps[<i>].uses)
+    is comparison identity across backends; line/column are diagnostics
+    only. `raw_target` is the scalar without quotes or trailing comment.
+    External/reusable targets split at the FINAL `@`; a target that cannot
+    be split is still returned, with action=None/ref=None plus an
+    INVALID_USES_TARGET diagnostic — the parser reports structure, policy
+    judges validity. Positions are 1-based; end positions are None when
+    unknown (lab/0 never fabricates rewrite spans from line matching).
+    """
+    file: str
+    semantic_path: str
+    kind: str
+    raw_target: str
+    action: Optional[str]
+    ref: Optional[str]
+    line: int
+    column: int
+    end_line: Optional[int] = None
+    end_column: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class ParseDiagnostic:
+    """A parser finding. severity `error` means the scan cannot be trusted
+    as complete (the owning ParseResult must carry accepted=False);
+    `warning`/`note` are advisory. Messages never quote arbitrary workflow
+    line content (scripts may embed secrets) — only positions, codes, and
+    `uses` target values."""
+    file: str
+    code: str
+    message: str
+    severity: str
+    line: Optional[int] = None
+    column: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class ParseResult:
+    """What one backend concluded about one file. accepted=False means
+    "this scan is not evidence of absence": callers must treat the file
+    as unverified, never as reference-free."""
+    backend: str
+    references: Tuple[WorkflowReference, ...]
+    diagnostics: Tuple[ParseDiagnostic, ...]
+    accepted: bool
+
+
+# Same owner/repo[/subpath] shape the legacy USES_PATTERN accepts.
+_ACTION_SHAPE = re.compile(
+    r"^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+(?:/[a-zA-Z0-9_./%-]+)?$"
+)
+
+
+def classify_uses_target(raw_target, job_level):
+    """Classify a `uses` scalar -> (kind, action, ref, problem).
+
+    Order per IMPLEMENTATION.md: docker:// first, then local paths, then
+    job-level reusable workflows, then step-level external actions.
+    `problem` explains a target that cannot be split into action@ref (the
+    caller emits INVALID_USES_TARGET); the reference is still returned —
+    never dropped — so downstream policy sees it. Ref VALUES are not
+    filtered here: mutability and validity are verify's job, not the
+    parser's.
+    """
+    if raw_target.startswith("docker://"):
+        return "docker-image", None, None, None
+    if raw_target.startswith("./") or raw_target.startswith("../"):
+        return "local-action", None, None, None
+    kind = "reusable-workflow" if job_level else "external-action"
+    action, sep, ref = raw_target.rpartition("@")
+    if not sep or not action or not ref:
+        return kind, None, None, "target has no @ref"
+    if not _ACTION_SHAPE.match(action):
+        return kind, None, None, "target is not owner/repo[/subpath]@ref"
+    if re.search(r"\s", ref):
+        return kind, None, None, "ref contains whitespace"
+    return kind, action, ref, None
+
+
+class WorkflowParserBackend:
+    """Contract: parse exactly one workflow file into a ParseResult.
+
+    Backends are offline and deterministic: no network, no YAML includes,
+    no reading beyond the given path, no mutation. A backend may support
+    less YAML than GitHub accepts, but it must say so (diagnostics plus
+    accepted=False) rather than return a silently incomplete scan.
+    """
+
+    name = "abstract"
+
+    def parse_file(self, repo_root, path):
+        raise NotImplementedError
+
+
+# Lab v0 line shapes. Every pattern is single-pass with no nested
+# unbounded quantifiers (see the long-line regression tests).
+_LAB_KEY_LINE = re.compile(
+    r"^(?P<key>[A-Za-z_][A-Za-z0-9_.-]*)\s*:(?:[ \t]+(?P<value>.*))?$"
+)
+# Any `uses:`-shaped key (quoted or not) that the scanner did not
+# positively classify or safely exclude must reject the file.
+_LAB_SUSPECT_USES = re.compile(r"""(?<![\w-])["']?uses["']?\s*:""")
+_LAB_BLOCK_HEADER = re.compile(r"^[|>][0-9+-]{0,2}[ \t]*(?:#.*)?$")
+_LAB_JOB_ID = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
+_LAB_SQUOTED = re.compile(r"^'(?P<body>(?:[^']|'')*)'[ \t]*(?:#.*)?$")
+_LAB_DQUOTED = re.compile(r'^"(?P<body>(?:[^"\\]|\\.)*)"[ \t]*(?:#.*)?$')
+# A mapping key written as a QUOTED scalar, e.g. `"uses":` or `'uses':`.
+# lab/0 does not model quoted keys, and — crucially — a quoted key can hide
+# an executable `uses` from a name-based scan: `"uses":` decodes to
+# `uses` on GitHub but shares no literal bytes with `uses`. Any quoted key
+# in the jobs section is therefore rejected outright (fail closed), not
+# guessed. The alternation is linear (no nested unbounded quantifiers).
+_LAB_QUOTED_KEY = re.compile(
+    r"""^(?:"(?:[^"\\]|\\.)*"|'(?:[^']|'')*')[ \t]*:"""
+)
+# Plain (unquoted) scalars that a YAML 1.2 loader resolves to a NON-STRING
+# value: null/bool/int/float, plus the timestamp/date forms ruamel's
+# round-trip resolver retains. The stable backend fails such nodes closed
+# (USES_NOT_STRING / NON_STRING_KEY); lab/0 must never ACCEPT bytes stable
+# rejects, so a plain scalar matching this in a `uses` slot or a tracked
+# mapping key fails closed here too. Deliberately NOT included: the YAML
+# 1.1-only booleans (yes/no/on/off) — in 1.2 those are ordinary strings,
+# and `on:` heads every workflow. Single pass, no nested unbounded
+# quantifiers.
+_LAB_NONSTRING_PLAIN = re.compile(
+    r"""^(?:
+        ~|null|Null|NULL
+        |true|True|TRUE|false|False|FALSE
+        |[-+]?[0-9][0-9_]*                              # decimal int
+        |0[oO][0-7]+                                    # octal int
+        |[-+]?0[xX][0-9a-fA-F]+                         # hex int
+        |[-+]?(?:[0-9][0-9_]*\.[0-9_]*|\.[0-9][0-9_]*)  # float
+            (?:[eE][-+]?[0-9]+)?
+        |[-+]?[0-9][0-9_]*[eE][-+]?[0-9]+               # exponent float
+        |[-+]?\.(?:inf|Inf|INF)|\.(?:nan|NaN|NAN)
+        |[0-9]{4}-[0-9]{1,2}-[0-9]{1,2}                 # date / timestamp
+            (?:[Tt ][0-9][0-9:.+\-TtZz ]*)?
+    )$""",
+    re.VERBOSE,
+)
+
+
+def _flow_delta(line):
+    """Net flow-collection nesting change on one line: +1 per unmatched
+    `[`/`{`, -1 per `]`/`}`, ignoring delimiters inside quotes or after a
+    `#` comment. lab/0 does not model flow collections that span lines; the
+    scanner uses this only to notice it is INSIDE an open one and fail
+    closed, never to interpret the flow. Single pass, no backtracking."""
+    depth = 0
+    quote = None
+    i = 0
+    n = len(line)
+    while i < n:
+        c = line[i]
+        if quote == "'":
+            if c == "'":
+                if i + 1 < n and line[i + 1] == "'":
+                    i += 2
+                    continue
+                quote = None
+        elif quote == '"':
+            if c == "\\":
+                i += 2
+                continue
+            if c == '"':
+                quote = None
+        else:
+            if c == "#" and (i == 0 or line[i - 1] in " \t"):
+                break
+            if c in "'\"":
+                quote = c
+            elif c in "[{":
+                depth += 1
+            elif c in "]}":
+                depth -= 1
+        i += 1
+    return depth
+
+
+def _lab_scalar(value):
+    """Extract the text of an inline YAML scalar -> (text, problem).
+
+    Handles plain, single-quoted, and double-quoted scalars with trailing
+    comments. Anything else (anchors, aliases, tags, flow collections,
+    block headers, unterminated quotes, escape sequences) returns
+    (None, why) so the caller fails closed with LAB_UNCLASSIFIED_USES.
+    """
+    if value.startswith("'"):
+        m = _LAB_SQUOTED.match(value)
+        if not m:
+            return None, "unterminated or malformed single-quoted scalar"
+        return m.group("body").replace("''", "'"), None
+    if value.startswith('"'):
+        m = _LAB_DQUOTED.match(value)
+        if not m:
+            return None, "unterminated or malformed double-quoted scalar"
+        body = m.group("body")
+        if "\\" in body:
+            return None, "double-quoted escapes are outside lab/0's language"
+        return body, None
+    if value[:1] in "&*!":
+        return None, "anchors, aliases and tags are outside lab/0's language"
+    if value[:1] in "[{":
+        return None, "flow collections are outside lab/0's language"
+    if value[:1] == "#":
+        return None, "empty scalar"
+    if _LAB_BLOCK_HEADER.match(value):
+        return None, "block scalars are outside lab/0's language for `uses`"
+    text = re.split(r"[ \t]+#", value, maxsplit=1)[0].rstrip()
+    if not text:
+        return None, "empty scalar"
+    return text, None
+
+
+def _lab_scan(rel_file, lines):
+    """Scan decoded workflow lines -> (references, diagnostics, accepted).
+
+    Fail-closed invariants: every `uses:`-shaped line is either emitted as
+    a reference, safely excluded (full-line comment or block-scalar body),
+    or reported as LAB_UNCLASSIFIED_USES with accepted=False. YAML the
+    tracker does not model on a jobs path — anchors/aliases/merge
+    keys/tags in the jobs section, flow-style steps, extra documents, tab
+    indentation, explicit block-scalar indentation — is
+    LAB_UNSUPPORTED_SYNTAX with accepted=False. A repeated semantic path
+    is DUPLICATE_PATH with accepted=False. A repeated key in any tracked
+    block mapping is DUPLICATE_KEY with accepted=False (GitHub rejects the
+    file, and a duplicate `steps:`/`jobs:` would re-anchor path identity
+    mid-scan). Plain scalars that YAML 1.2 types as non-strings
+    (true/null/123/dates) in a `uses` slot or a tracked mapping key fail
+    closed — the structural backend rejects those bytes, and lab/0 must
+    never accept what stable rejects. A quoted scalar value that does not
+    close on its own line, or a flow collection still open at end of
+    file, is LAB_UNSUPPORTED_SYNTAX with accepted=False.
+    """
+    references = []
+    diagnostics = []
+    state = {"accepted": True}
+    seen_paths = set()
+
+    def diag(code, message, severity="error", line=None, column=None):
+        diagnostics.append(
+            ParseDiagnostic(rel_file, code, message, severity, line, column)
+        )
+        if severity == "error":
+            state["accepted"] = False
+
+    def emit(path, lineno, key_col, value, value_col, job_level):
+        """Record one `uses` reference; any doubt becomes a diagnostic."""
+        if value is None:
+            diag(
+                "LAB_UNCLASSIFIED_USES",
+                "`uses:` has no inline scalar value",
+                line=lineno, column=key_col + 1,
+            )
+            return
+        scalar, problem = _lab_scalar(value)
+        if scalar is None:
+            diag(
+                "LAB_UNCLASSIFIED_USES",
+                f"`uses:` value not classifiable: {problem}",
+                line=lineno, column=value_col + 1,
+            )
+            return
+        if value[:1] not in ("'", '"') and _LAB_NONSTRING_PLAIN.match(scalar):
+            # A plain `true`/`null`/`123`/date is a non-string YAML node:
+            # stable fails it closed as USES_NOT_STRING, so lab/0 must not
+            # accept it as a string reference. (Quoted, it IS a string and
+            # flows through as an INVALID_USES_TARGET warning, matching
+            # stable.)
+            diag(
+                "LAB_UNCLASSIFIED_USES",
+                "plain `uses:` scalar resolves to a non-string YAML type",
+                line=lineno, column=value_col + 1,
+            )
+            return
+        if path in seen_paths:
+            diag(
+                "DUPLICATE_PATH",
+                f"semantic path {path} occurs more than once",
+                line=lineno, column=key_col + 1,
+            )
+            return
+        seen_paths.add(path)
+        kind, action, ref, problem = classify_uses_target(scalar, job_level)
+        if problem:
+            diag(
+                "INVALID_USES_TARGET",
+                f"`{scalar}`: {problem}",
+                severity="warning", line=lineno, column=value_col + 1,
+            )
+        references.append(WorkflowReference(
+            file=rel_file, semantic_path=path, kind=kind, raw_target=scalar,
+            action=action, ref=ref, line=lineno, column=value_col + 1,
+        ))
+
+    block = None            # {"key_indent": int, "content_indent": int|None}
+    doc_started = False     # any structural content seen yet
+    doc_marker = False      # a leading `---` seen
+    top_keys_seen = set()
+    jobs_open = False       # inside a block-mapping `jobs:` section
+    job_indent = None       # indent of job-id keys
+    job_ids = set()
+    cur_job = None
+    job_child_indent = None  # indent of keys inside the current job
+    in_steps = False
+    steps_key_indent = None
+    item_indent = None      # dash column of step items
+    step_index = -1
+    step_key_indent = None  # key column inside the current step item
+    flow_depth = 0          # open [ ] / { } nesting carried across lines
+    frames = []             # [key column, keys seen] per open block mapping
+
+    for lineno, raw in enumerate(lines, 1):
+        line = raw.rstrip("\r")
+
+        # Block-scalar bodies are opaque text: nothing inside one can be
+        # an executable `uses` — and nothing inside one may leak out as a
+        # fake reference either.
+        if block is not None:
+            if not line.strip():
+                continue
+            body_indent = len(line) - len(line.lstrip(" "))
+            if body_indent > block["key_indent"]:
+                if block["content_indent"] is None:
+                    block["content_indent"] = body_indent
+                elif body_indent < block["content_indent"]:
+                    diag(
+                        "LAB_UNSUPPORTED_SYNTAX",
+                        "block scalar dedents below its first content line",
+                        line=lineno,
+                    )
+                continue
+            block = None  # this line ends the block; process it normally
+
+        stripped = line.strip()
+        if not stripped:
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        if line[indent:indent + 1] == "\t":
+            diag("LAB_UNSUPPORTED_SYNTAX", "tab indentation", line=lineno)
+            continue
+        if stripped.startswith("#"):
+            continue  # full-line comments are structure-free by definition
+        if stripped.startswith("%") and not doc_started:
+            diag(
+                "LAB_UNSUPPORTED_SYNTAX",
+                "YAML directives are outside lab/0's language",
+                line=lineno,
+            )
+            continue
+        if stripped == "---" or stripped.startswith("--- "):
+            if doc_started or doc_marker or stripped != "---":
+                diag(
+                    "LAB_UNSUPPORTED_SYNTAX",
+                    "multiple YAML documents (or content after `---`)",
+                    line=lineno,
+                )
+            doc_marker = True
+            continue
+        if stripped == "..." or stripped.startswith("... "):
+            diag("LAB_UNSUPPORTED_SYNTAX", "document end marker", line=lineno)
+            continue
+        doc_started = True
+
+        # Flow collections that span lines defeat the block tracker: a
+        # continuation line (e.g. the second half of `- { name: x,` \n
+        # `uses: a/b@v1 }`) looks like an ordinary mapping key and would be
+        # emitted with the closing `}` glued onto its target. lab/0 does
+        # not model multi-line flow — once one is open, every line inside
+        # it is rejected. Balanced single-line flow (a matrix `[a, b]`)
+        # nets to zero and is unaffected; a `uses` lookalike on such a line
+        # is still caught by the suspicion net. The depth update runs
+        # before any downstream `continue` so it can never be skipped.
+        if flow_depth > 0:
+            diag(
+                "LAB_UNSUPPORTED_SYNTAX",
+                "multi-line flow collection is outside lab/0's language",
+                line=lineno,
+            )
+            flow_depth = max(0, flow_depth + _flow_delta(line))
+            continue
+        flow_depth = max(0, flow_depth + _flow_delta(line))
+
+        # Split leading sequence dashes off the line (`- uses: x`,
+        # `- - x`, a lone `-`), tracking the column where content starts.
+        rest = line[indent:]
+        col = indent
+        dash_cols = []
+        while rest == "-" or rest.startswith("- "):
+            dash_cols.append(col)
+            if rest == "-":
+                col += 1
+                rest = ""
+                break
+            advance = 1
+            while advance < len(rest) and rest[advance] == " ":
+                advance += 1
+            col += advance
+            rest = rest[advance:]
+
+        key = value = None
+        value_col = col
+        km = _LAB_KEY_LINE.match(rest)
+        if km:
+            key = km.group("key")
+            value = km.group("value")
+            if value is not None:
+                if not value.strip() or value.lstrip().startswith("#"):
+                    value = None
+                else:
+                    value_col = col + km.start("value")
+                    value = value.rstrip()
+
+        # Duplicate mapping keys anywhere in the document: GitHub rejects
+        # the file outright, and a duplicate on a tracked path (`steps:`
+        # twice in one job) would silently re-anchor the tracker mid-job.
+        # Block-mapping nesting is modeled as frames of (key column, keys
+        # seen); a shallower key or a new sequence item closes every frame
+        # opened deeper than it. Quoted keys are not tracked here — inside
+        # `jobs:` they are rejected wholesale below, elsewhere they are
+        # outside lab/0's modeled language.
+        if dash_cols:
+            while frames and frames[-1][0] > dash_cols[0]:
+                frames.pop()
+        if key is not None:
+            while frames and frames[-1][0] > col:
+                frames.pop()
+            if frames and frames[-1][0] == col:
+                if key in frames[-1][1]:
+                    diag(
+                        "DUPLICATE_KEY",
+                        f"duplicate mapping key `{key}` "
+                        "(GitHub rejects the workflow)",
+                        line=lineno, column=col + 1,
+                    )
+                frames[-1][1].add(key)
+            else:
+                frames.append((col, {key}))
+
+        # A value (or scalar sequence item) that OPENS a quote but does not
+        # CLOSE it on the same line is a multi-line quoted scalar — legal
+        # YAML, but a construct lab/0 does not model; content after a closed
+        # quote is malformed YAML outright. Either way: fail closed rather
+        # than scan half a scalar. (A plain scalar merely CONTAINING quotes,
+        # like `run: echo "don't`, starts with a letter and is untouched.)
+        quote_opening = None
+        if key is not None and value is not None and value[:1] in ("'", '"'):
+            quote_opening = value
+        elif (
+            km is None
+            and rest[:1] in ("'", '"')
+            and not _LAB_QUOTED_KEY.match(rest)
+        ):
+            quote_opening = rest
+        if quote_opening is not None:
+            fullq = _LAB_SQUOTED if quote_opening[0] == "'" else _LAB_DQUOTED
+            if not fullq.match(quote_opening):
+                diag(
+                    "LAB_UNSUPPORTED_SYNTAX",
+                    "quoted scalar does not end on its own line "
+                    "(multi-line quoted scalars are outside lab/0's language)",
+                    line=lineno,
+                )
+
+        # A QUOTED mapping key in the jobs section is not modeled — and is
+        # a fail-open risk the name-based suspicion net cannot cover: a key
+        # written `"uses":` (or with an escape, `"uses":`) executes as
+        # `uses` on GitHub while sharing no literal bytes with `uses`. So a
+        # quoted key inside `jobs:` is rejected outright rather than
+        # guessed. At column 0 it is instead a new top-level section
+        # (unusual, but `"on":` is legal), which simply ends the jobs block.
+        if jobs_open and km is None and _LAB_QUOTED_KEY.match(rest):
+            if indent == 0 and not dash_cols:
+                jobs_open = False
+                job_indent = cur_job = job_child_indent = None
+                in_steps = False
+                steps_key_indent = item_indent = step_key_indent = None
+                step_index = -1
+                continue
+            diag(
+                "LAB_UNSUPPORTED_SYNTAX",
+                "quoted mapping key in the jobs section is outside lab/0's "
+                "language (a quoted key can hide an executable `uses`)",
+                line=lineno,
+            )
+            continue
+
+        # Merge keys and complex keys inside jobs can inject steps the
+        # tracker cannot see — fail closed.
+        if jobs_open and (
+            rest.startswith("<<") or rest == "?" or rest.startswith("? ")
+        ):
+            diag(
+                "LAB_UNSUPPORTED_SYNTAX",
+                "merge/complex keys are outside lab/0's language",
+                line=lineno,
+            )
+            continue
+
+        # Does this line open a block scalar? (Its body is opaque text.)
+        opens_block = None
+        if key is not None and value is not None and _LAB_BLOCK_HEADER.match(value):
+            opens_block = {"key_indent": col, "content_indent": None}
+        elif dash_cols and rest and _LAB_BLOCK_HEADER.match(rest):
+            opens_block = {"key_indent": dash_cols[-1], "content_indent": None}
+        if opens_block is not None and re.search(r"\d", (value or rest)[:3]):
+            diag(
+                "LAB_UNSUPPORTED_SYNTAX",
+                "explicit block-scalar indentation indicator",
+                line=lineno,
+            )
+
+        handled = False
+
+        if key is not None and not dash_cols and indent == 0:
+            # A top-level section key. Duplicates are duplicate YAML keys
+            # (GitHub rejects the file) and would corrupt path identity.
+            if key in top_keys_seen:
+                diag(
+                    "LAB_UNSUPPORTED_SYNTAX",
+                    f"duplicate top-level key `{key}`",
+                    line=lineno,
+                )
+            top_keys_seen.add(key)
+            if _LAB_NONSTRING_PLAIN.match(key):
+                # Stable fails non-string keys closed at every container on
+                # the `uses` path (NON_STRING_KEY); mirror it at the levels
+                # lab/0 tracks so lab never accepts what stable rejects.
+                diag(
+                    "LAB_UNSUPPORTED_SYNTAX",
+                    f"top-level key `{key}` resolves to a non-string "
+                    "YAML type",
+                    line=lineno,
+                )
+            jobs_open = key == "jobs" and value is None and opens_block is None
+            job_indent = None
+            cur_job = None
+            job_child_indent = None
+            in_steps = False
+            steps_key_indent = None
+            item_indent = None
+            step_index = -1
+            step_key_indent = None
+            # `jobs:` with an inline value (flow mapping, anchor, alias)
+            # is outside the modeled language; any `uses:` under it falls
+            # through to the suspicion net below.
+        elif jobs_open and key is not None and not dash_cols:
+            # A mapping key somewhere inside the `jobs:` block.
+            if value is not None and value[:1] in "&*!":
+                diag(
+                    "LAB_UNSUPPORTED_SYNTAX",
+                    "anchor/alias/tag in the jobs section",
+                    line=lineno,
+                )
+                handled = True
+            elif job_indent is None or indent == job_indent:
+                job_indent = indent
+                cur_job = key
+                job_child_indent = None
+                in_steps = False
+                steps_key_indent = None
+                item_indent = None
+                step_index = -1
+                step_key_indent = None
+                if not _LAB_JOB_ID.match(key):
+                    diag(
+                        "LAB_UNSUPPORTED_SYNTAX",
+                        "job id does not fit lab/0's path grammar",
+                        line=lineno,
+                    )
+                elif _LAB_NONSTRING_PLAIN.match(key):
+                    diag(
+                        "LAB_UNSUPPORTED_SYNTAX",
+                        f"job id `{key}` resolves to a non-string YAML type",
+                        line=lineno,
+                    )
+                elif key in job_ids:
+                    diag(
+                        "LAB_UNSUPPORTED_SYNTAX",
+                        f"duplicate job id `{key}`",
+                        line=lineno,
+                    )
+                job_ids.add(key)
+            elif indent < job_indent:
+                diag(
+                    "LAB_UNSUPPORTED_SYNTAX",
+                    "unexpected dedent inside `jobs:`",
+                    line=lineno,
+                )
+            elif cur_job is None:
+                diag(
+                    "LAB_UNSUPPORTED_SYNTAX",
+                    "mapping nested under `jobs:` without a job id",
+                    line=lineno,
+                )
+            else:
+                if job_child_indent is None:
+                    job_child_indent = indent
+                if indent == job_child_indent:
+                    if _LAB_NONSTRING_PLAIN.match(key):
+                        diag(
+                            "LAB_UNSUPPORTED_SYNTAX",
+                            f"job field key `{key}` resolves to a "
+                            "non-string YAML type",
+                            line=lineno,
+                        )
+                    in_steps = False
+                    if key == "steps":
+                        if value is not None or opens_block is not None:
+                            diag(
+                                "LAB_UNSUPPORTED_SYNTAX",
+                                "`steps:` with an inline or block value",
+                                line=lineno,
+                            )
+                            handled = True
+                        else:
+                            in_steps = True
+                            steps_key_indent = indent
+                            item_indent = None
+                            step_index = -1
+                            step_key_indent = None
+                    elif key == "uses":
+                        emit(
+                            f"jobs.{cur_job}.uses", lineno, col,
+                            value, value_col, job_level=True,
+                        )
+                        handled = True
+                elif indent > job_child_indent:
+                    if in_steps and item_indent is not None and step_index >= 0:
+                        if step_key_indent is None and indent > item_indent:
+                            step_key_indent = indent
+                        if (
+                            indent == step_key_indent
+                            and _LAB_NONSTRING_PLAIN.match(key)
+                        ):
+                            diag(
+                                "LAB_UNSUPPORTED_SYNTAX",
+                                f"step key `{key}` resolves to a "
+                                "non-string YAML type",
+                                line=lineno,
+                            )
+                        if indent == step_key_indent and key == "uses":
+                            emit(
+                                f"jobs.{cur_job}.steps[{step_index}].uses",
+                                lineno, col, value, value_col,
+                                job_level=False,
+                            )
+                            handled = True
+                    # Otherwise: nested config under a job or step key —
+                    # not a `uses` slot; the suspicion net still applies.
+                else:
+                    diag(
+                        "LAB_UNSUPPORTED_SYNTAX",
+                        f"unexpected dedent inside job `{cur_job}`",
+                        line=lineno,
+                    )
+        elif jobs_open and dash_cols:
+            if not in_steps or cur_job is None:
+                # A sequence outside steps (matrix values, branch lists…)
+                # cannot hold an executable `uses` — the net still looks.
+                pass
+            else:
+                d = dash_cols[0]
+                if item_indent is None:
+                    if d >= steps_key_indent:
+                        item_indent = d
+                    else:
+                        diag(
+                            "LAB_UNSUPPORTED_SYNTAX",
+                            "sequence item left of its `steps:` key",
+                            line=lineno,
+                        )
+                        handled = True
+                if item_indent is not None and d == item_indent:
+                    if len(dash_cols) > 1:
+                        diag(
+                            "LAB_UNSUPPORTED_SYNTAX",
+                            "nested sequence in `steps`",
+                            line=lineno,
+                        )
+                        handled = True
+                    else:
+                        step_index += 1
+                        step_key_indent = None
+                        if rest == "":
+                            pass  # a lone dash; keys follow on later lines
+                        elif key is not None:
+                            step_key_indent = col
+                            if _LAB_NONSTRING_PLAIN.match(key):
+                                diag(
+                                    "LAB_UNSUPPORTED_SYNTAX",
+                                    f"step key `{key}` resolves to a "
+                                    "non-string YAML type",
+                                    line=lineno,
+                                )
+                            if value is not None and value[:1] in "&*!":
+                                diag(
+                                    "LAB_UNSUPPORTED_SYNTAX",
+                                    "anchor/alias/tag in the jobs section",
+                                    line=lineno,
+                                )
+                                handled = True
+                            elif key == "uses":
+                                emit(
+                                    f"jobs.{cur_job}.steps[{step_index}].uses",
+                                    lineno, col, value, value_col,
+                                    job_level=False,
+                                )
+                                handled = True
+                        elif rest[:1] in "&*!":
+                            diag(
+                                "LAB_UNSUPPORTED_SYNTAX",
+                                "anchor/alias/tag step item",
+                                line=lineno,
+                            )
+                            handled = True
+                        # else: a scalar step — GitHub rejects those; the
+                        # suspicion net still guards `uses:` lookalikes.
+                elif item_indent is not None and d > item_indent:
+                    pass  # a sequence inside a step field — net applies
+                elif item_indent is not None:
+                    diag(
+                        "LAB_UNSUPPORTED_SYNTAX",
+                        "unexpected sequence dedent inside `steps`",
+                        line=lineno,
+                    )
+                    handled = True
+
+        # The suspicion net: a `uses:`-shaped token anywhere on a line the
+        # scanner did not positively classify or safely exclude is
+        # uncertainty, and uncertainty is never reported as absence.
+        if not handled:
+            suspect = _LAB_SUSPECT_USES.search(line)
+            if suspect:
+                diag(
+                    "LAB_UNCLASSIFIED_USES",
+                    "`uses:`-shaped text the scanner cannot place at "
+                    "jobs.<job>.uses or jobs.<job>.steps[<i>].uses",
+                    line=lineno, column=suspect.start() + 1,
+                )
+            elif jobs_open and key is None and not dash_cols:
+                # Inside a block mapping, every line is a `key:`, a `- item`,
+                # a comment, or blank. A bare scalar line is none of those:
+                # it is a multi-line plain-scalar CONTINUATION that folds
+                # into the previous value on GitHub (so a `uses:` already
+                # emitted from that value's first line is truncated). lab/0
+                # does not model line folding — fail closed rather than
+                # trust a half-read scalar.
+                diag(
+                    "LAB_UNSUPPORTED_SYNTAX",
+                    "unrecognized line in the jobs section — multi-line "
+                    "scalars and other unmodeled constructs are outside "
+                    "lab/0's language",
+                    line=lineno,
+                )
+            elif indent == 0 and dash_cols:
+                # A workflow root is a block mapping; a root-level sequence
+                # item means the document is not a workflow shape stable
+                # accepts (ROOT_NOT_MAPPING / JOBS_NOT_MAPPING).
+                diag(
+                    "LAB_UNSUPPORTED_SYNTAX",
+                    "sequence item at the document root — a workflow root "
+                    "must be a block mapping",
+                    line=lineno,
+                )
+            elif indent == 0 and key is None and not _LAB_QUOTED_KEY.match(rest):
+                # A root line that is neither a plain key, a quoted string
+                # key, a comment, nor a document marker: a non-string key
+                # (`123:`), a flow/complex key, or a stray scalar. Stable
+                # fails all of these closed (NON_STRING_KEY or
+                # ROOT_NOT_MAPPING); lab/0 must not accept what stable
+                # rejects.
+                diag(
+                    "LAB_UNSUPPORTED_SYNTAX",
+                    "unmodeled top-level line — a workflow root must be a "
+                    "block mapping with string keys",
+                    line=lineno,
+                )
+
+        if opens_block is not None:
+            block = opens_block
+
+    if flow_depth > 0:
+        # `broken: [never closed` at end of file: the flow tracker is still
+        # inside an open collection, so the document cannot have parsed as
+        # complete YAML. Unfinished syntax is rejected, not ignored.
+        diag(
+            "LAB_UNSUPPORTED_SYNTAX",
+            "flow collection still open at end of file",
+        )
+
+    return references, diagnostics, state["accepted"]
+
+
+class LegacyRegexBackend(WorkflowParserBackend):
+    """Lab v0 (`lab/0`): the legacy line scanner behind the backend seam.
+
+    A minimal indentation-aware tracker assigns each accepted `uses:` a
+    semantic path (jobs.<job>.uses or jobs.<job>.steps[<i>].uses),
+    excludes full-line comments and block-scalar bodies, and REJECTS the
+    file (accepted=False — never an empty success) whenever it meets
+    syntax it does not model safely. Scan-only: it never rewrites, never
+    touches the network, and reads only the file it was given.
+
+    Known, intentional differences from the compatibility parse_workflows
+    scanner: lab/0 excludes fake `uses:` inside block scalars instead of
+    matching them, returns local and docker references as classified kinds
+    instead of skipping them, and does not pre-filter ref values (policy's
+    job). Compare mode exists to measure exactly these gaps.
+    """
+
+    name = "lab/0"
+
+    def parse_file(self, repo_root, path):
+        """Parse one workflow file. I/O or decoding failure is reported as
+        LAB_IO_ERROR with accepted=False — never as an empty result."""
+        path = Path(path)
+        repo_root = Path(repo_root)
+        try:
+            rel = path.resolve().relative_to(repo_root.resolve()).as_posix()
+        except ValueError:
+            rel = path.as_posix()
+        try:
+            text = path.read_bytes().decode("utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            note = ParseDiagnostic(
+                rel, "LAB_IO_ERROR",
+                f"cannot read workflow as UTF-8 text: {exc.__class__.__name__}",
+                "error", None, None,
+            )
+            return ParseResult(self.name, (), (note,), accepted=False)
+        if text.startswith("\ufeff"):
+            text = text[1:]
+        references, diagnostics, accepted = _lab_scan(rel, text.split("\n"))
+        return ParseResult(
+            backend=self.name,
+            references=tuple(sorted(references)),
+            diagnostics=tuple(diagnostics),
+            accepted=accepted,
+        )
+
+
+# The exact ruamel.yaml release vendored with the tool. The pin is checked at
+# runtime and its source wheel/provenance/file hashes live under third_party.
+STABLE_RUAMEL_PIN = "0.19.1"
+
+# Refuse to parse a workflow larger than this (bytes). Real workflows are a
+# few KiB; anything past this is pathological and gets a fail-closed
+# YAML_PARSE_ERROR before ruamel is handed the input.
+STABLE_MAX_BYTES = 5 * 1024 * 1024
+
+
+# Distinct "no bad key" sentinel: a null YAML key is itself `None`, so None
+# cannot double as "all keys are strings".
+_ALL_KEYS_STRING = object()
+
+
+def _stable_nonstring_key(mapping):
+    """First key of `mapping` that is not a plain string, else the
+    `_ALL_KEYS_STRING` sentinel.
+
+    ruamel round-trip construction can yield keys that are NOT `str`
+    instances: a tagged scalar (`!!str uses`), or an int/bool/null key.
+    Such a key can carry the executable name `uses`/`jobs`/`steps` while
+    silently failing an `in`/`[]` lookup — the exact fail-open a name-based
+    walk must guard against. Every mapping on the path to a `uses` is
+    checked; any non-string key fails the scan closed. Quoted string keys
+    are ordinary `str` subclasses and pass. The sentinel (not `None`) marks
+    success, because a null key legitimately IS `None`.
+    """
+    for key in mapping:
+        if not isinstance(key, str):
+            return key
+    return _ALL_KEYS_STRING
+
+
+def _stable_pos(container, key, want_value=True):
+    """1-based (line, column) for `key` (or its value) in a ruamel node.
+
+    ruamel stores 0-based positions in `node.lc.data[key]` as
+    `[key_line, key_col, value_line, value_col]`. Returns (None, None) when
+    location metadata is unavailable — positions are diagnostics, never
+    identity, so their absence must not change classification.
+    """
+    lc = getattr(container, "lc", None)
+    data = getattr(lc, "data", None) if lc is not None else None
+    try:
+        entry = data[key]
+    except (TypeError, KeyError, IndexError):
+        return None, None
+    if want_value and len(entry) >= 4:
+        return entry[2] + 1, entry[3] + 1
+    if len(entry) >= 2:
+        return entry[0] + 1, entry[1] + 1
+    return None, None
+
+
+def _stable_uses_pos(container, key, source_lines):
+    """Value position for a `uses` key, correcting ruamel alias metadata.
+
+    For `uses: *alias`, ruamel records the value position at the anchor's
+    definition rather than at the executable alias slot. Rewriting that
+    reported position would mutate shared data outside `uses`. The mapping
+    key position still points at the real slot, so derive the alias token
+    column from that exact source line and keep the public location honest.
+    """
+    lc = getattr(container, "lc", None)
+    data = getattr(lc, "data", None) if lc is not None else None
+    try:
+        entry = data[key]
+    except (TypeError, KeyError, IndexError):
+        return _stable_pos(container, key)
+    if len(entry) >= 4 and entry[2] < entry[0] and source_lines:
+        key_line, key_col = entry[0], entry[1]
+        try:
+            line = source_lines[key_line]
+        except IndexError:
+            return _stable_pos(container, key)
+        colon = line.find(":", key_col)
+        if colon >= 0:
+            cursor = colon + 1
+            while cursor < len(line) and line[cursor] in " \t":
+                cursor += 1
+            if cursor < len(line) and line[cursor] == "*":
+                return key_line + 1, cursor + 1
+    return _stable_pos(container, key)
+
+
+class StructuralYamlBackend(WorkflowParserBackend):
+    """`stable`: a structural YAML backend built on ruamel.yaml in YAML 1.2
+    round-trip mode.
+
+    Unlike lab/0's line scanner, this parses the real document tree, so it
+    correctly handles anchors/aliases, quoting, flow collections, and
+    multi-line scalars that lab/0 deliberately refuses. It walks ONLY the
+    two executable `uses` slots — jobs.<id>.uses and
+    jobs.<id>.steps[<i>].uses — and reports structural problems as typed
+    diagnostics.
+
+    Fail-closed contract (shared by every backend): a malformed container
+    ON THE PATH to a possible `uses` (root/jobs/job/steps/step of the wrong
+    type, a non-string `uses`, duplicate keys, multiple documents, or any
+    YAML error) yields accepted=False, never a silent empty scan. Round-trip
+    mode never constructs arbitrary Python objects, so a `!!python/...` tag
+    is preserved as a non-string node and fails closed on the `uses` path
+    rather than executing.
+
+    This backend does not rewrite and does no I/O beyond reading the one
+    file it is given. It is not yet the production default (ADR 0001).
+    """
+
+    name = "stable"
+
+    def _loader(self):
+        """A fresh YAML 1.2 round-trip loader, configured to fail closed:
+        duplicate keys raise, and no unsafe Python object construction."""
+        from ruamel.yaml import YAML
+        yaml = YAML(typ="rt")
+        yaml.version = (1, 2)
+        yaml.allow_duplicate_keys = False
+        yaml.preserve_quotes = True
+        return yaml
+
+    def parse_file(self, repo_root, path):
+        """Parse one workflow file into a ParseResult. Reads bytes from the
+        given path only; any parse failure fails closed with a diagnostic."""
+        from ruamel.yaml.error import YAMLError
+        from ruamel.yaml.constructor import DuplicateKeyError
+
+        path = Path(path)
+        repo_root = Path(repo_root)
+        try:
+            rel = path.resolve().relative_to(repo_root.resolve()).as_posix()
+        except ValueError:
+            rel = path.as_posix()
+
+        references = []
+        diagnostics = []
+        state = {"accepted": True}
+
+        def diag(code, message, severity="error", line=None, column=None):
+            diagnostics.append(
+                ParseDiagnostic(rel, code, message, severity, line, column)
+            )
+            if severity == "error":
+                state["accepted"] = False
+
+        try:
+            raw = path.read_bytes()
+        except OSError as exc:
+            diag("YAML_PARSE_ERROR",
+                 f"cannot read workflow: {exc.__class__.__name__}")
+            return ParseResult(self.name, (), tuple(diagnostics), False)
+        if raw.startswith(b"\xef\xbb\xbf"):
+            raw = raw[3:]
+
+        # An explicit input ceiling before parsing (IMPLEMENTATION.md
+        # performance envelope). A workflow larger than this is already
+        # pathological; refuse it rather than hand ruamel a memory bomb.
+        if len(raw) > STABLE_MAX_BYTES:
+            diag("YAML_PARSE_ERROR",
+                 f"workflow exceeds the {STABLE_MAX_BYTES}-byte scan limit")
+            return ParseResult(self.name, (), tuple(diagnostics), False)
+
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            line, col = _yaml_error_pos(exc)
+            diag("YAML_PARSE_ERROR",
+                 f"invalid YAML: {exc.__class__.__name__}",
+                 line=line, column=col)
+            return ParseResult(self.name, (), tuple(diagnostics), False)
+
+        yaml = self._loader()
+        try:
+            documents = list(yaml.load_all(text))
+        except DuplicateKeyError as exc:
+            line, col = _yaml_error_pos(exc)
+            diag("DUPLICATE_KEY",
+                 "duplicate mapping key (GitHub rejects the workflow)",
+                 line=line, column=col)
+            return ParseResult(self.name, (), tuple(diagnostics), False)
+        except (YAMLError, UnicodeDecodeError) as exc:
+            line, col = _yaml_error_pos(exc)
+            diag("YAML_PARSE_ERROR",
+                 f"invalid YAML: {exc.__class__.__name__}",
+                 line=line, column=col)
+            return ParseResult(self.name, (), tuple(diagnostics), False)
+        except RecursionError:
+            # Deeply nested collections exhaust the interpreter stack.
+            # RecursionError is a RuntimeError, not a YAMLError — catch it
+            # so a ~1 KB nesting bomb fails THIS file closed instead of
+            # aborting the whole scan with an uncaught traceback.
+            diag("YAML_PARSE_ERROR", "input nesting too deep to parse safely")
+            return ParseResult(self.name, (), tuple(diagnostics), False)
+        except Exception as exc:
+            # ruamel's constructors can raise bare builtin exceptions
+            # (ValueError, KeyError, AssertionError, ...) on adversarial
+            # tags and directives — none are YAMLError subclasses. A parser
+            # over untrusted input must convert ANY parse-time failure into
+            # a fail-closed result, never a crash that skips sibling files.
+            diag("YAML_PARSE_ERROR",
+                 f"parser raised {exc.__class__.__name__}")
+            return ParseResult(self.name, (), tuple(diagnostics), False)
+
+        if len(documents) > 1:
+            diag("MULTIPLE_DOCUMENTS",
+                 f"{len(documents)} YAML documents; a workflow must be exactly one")
+            return ParseResult(self.name, (), tuple(diagnostics), False)
+
+        root = documents[0] if documents else None
+        if root is None:
+            # An empty document has no jobs and therefore no `uses` to miss.
+            return ParseResult(self.name, (), tuple(diagnostics), True)
+
+        _stable_walk(rel, root, references, diag, text.splitlines())
+        return ParseResult(
+            backend=self.name,
+            references=tuple(sorted(references)),
+            diagnostics=tuple(diagnostics),
+            accepted=state["accepted"],
+        )
+
+
+def _yaml_error_pos(exc):
+    """1-based (line, column) from a ruamel error's problem_mark, or
+    (None, None)."""
+    mark = getattr(exc, "problem_mark", None) or getattr(exc, "context_mark", None)
+    if mark is None:
+        return None, None
+    return mark.line + 1, mark.column + 1
+
+
+def _stable_walk(rel, root, references, diag, source_lines=None):
+    """Visit the two executable `uses` slots in a parsed workflow tree.
+
+    Only jobs.<id>.uses and jobs.<id>.steps[<i>].uses are inspected. A node
+    of the WRONG type on that path (root/jobs/job/steps/step) fails closed
+    with its specific diagnostic; a benign empty (`None`) node simply has no
+    `uses` to find. A NON-STRING key anywhere on the path also fails closed:
+    a tagged or typed key can spell `uses` while dodging a name lookup.
+    Unrelated malformed job fields are ignored — actionlint territory — but
+    nothing on the path to a possible `uses` is trusted blindly.
+    """
+    if not isinstance(root, dict):
+        diag("ROOT_NOT_MAPPING", "workflow root is not a mapping")
+        return
+    bad = _stable_nonstring_key(root)
+    if bad is not _ALL_KEYS_STRING:
+        diag("NON_STRING_KEY",
+             f"top-level key `{bad!r}` is not a plain string")
+        return
+    if "jobs" not in root:
+        return  # a document with no `jobs:` has nothing lockable
+    jobs = root["jobs"]
+    if jobs is None:
+        return
+    if not isinstance(jobs, dict):
+        line, col = _stable_pos(root, "jobs")
+        diag("JOBS_NOT_MAPPING", "`jobs` is not a mapping", line=line, column=col)
+        return
+    bad = _stable_nonstring_key(jobs)
+    if bad is not _ALL_KEYS_STRING:
+        line, col = _stable_pos(root, "jobs")
+        diag("NON_STRING_KEY", f"job id `{bad!r}` is not a plain string",
+             line=line, column=col)
+        return
+
+    for job_id, job in jobs.items():
+        if job is None:
+            continue
+        if not isinstance(job, dict):
+            line, col = _stable_pos(jobs, job_id)
+            diag("JOB_NOT_MAPPING", f"job `{job_id}` is not a mapping",
+                 line=line, column=col)
+            continue
+        bad = _stable_nonstring_key(job)
+        if bad is not _ALL_KEYS_STRING:
+            line, col = _stable_pos(jobs, job_id)
+            diag("NON_STRING_KEY",
+                 f"key `{bad!r}` in job `{job_id}` is not a plain string",
+                 line=line, column=col)
+            continue
+
+        if "uses" in job:
+            line, col = _stable_uses_pos(job, "uses", source_lines)
+            _stable_emit(rel, f"jobs.{job_id}.uses", job["uses"], True,
+                         line, col, references, diag)
+
+        if "steps" in job and job["steps"] is not None:
+            steps = job["steps"]
+            if not isinstance(steps, list):
+                line, col = _stable_pos(job, "steps")
+                diag("STEPS_NOT_SEQUENCE", f"`steps` of job `{job_id}` is not a sequence",
+                     line=line, column=col)
+                continue
+            for idx, step in enumerate(steps):
+                if step is None:
+                    continue
+                if not isinstance(step, dict):
+                    line, col = _stable_pos(steps, idx)
+                    diag("STEP_NOT_MAPPING",
+                         f"jobs.{job_id}.steps[{idx}] is not a mapping",
+                         line=line, column=col)
+                    continue
+                bad = _stable_nonstring_key(step)
+                if bad is not _ALL_KEYS_STRING:
+                    line, col = _stable_pos(steps, idx)
+                    diag("NON_STRING_KEY",
+                         f"key `{bad!r}` in jobs.{job_id}.steps[{idx}] "
+                         "is not a plain string", line=line, column=col)
+                    continue
+                if "uses" in step:
+                    line, col = _stable_uses_pos(step, "uses", source_lines)
+                    _stable_emit(
+                        rel, f"jobs.{job_id}.steps[{idx}].uses", step["uses"],
+                        False, line, col, references, diag)
+
+    # Field invariant: a semantic path identifies ONE `uses` slot. Distinct
+    # string job ids and positional step indices can't collide, and ruamel
+    # rejects duplicate keys outright — but assert it rather than assume it.
+    seen = set()
+    for r in references:
+        if r.semantic_path in seen:
+            diag("DUPLICATE_PATH",
+                 f"semantic path {r.semantic_path} emitted more than once")
+        seen.add(r.semantic_path)
+
+
+def _stable_emit(rel, path, value, job_level, line, col, references, diag):
+    """Classify one `uses` value into a WorkflowReference, or fail closed.
+
+    A non-string value (null, number, sequence, mapping, or an unconstructed
+    `!!python/...` tag) means the `uses` slot exists but holds no
+    interpretable reference — USES_NOT_STRING, accepted=False. An
+    unsplittable target (`INVALID_USES_TARGET`) is a warning: the structure
+    was clear, only the value is off, and mutability/validity is policy's
+    call, not the parser's.
+    """
+    if not isinstance(value, str):
+        diag("USES_NOT_STRING",
+             f"{path} is not a string scalar", line=line, column=col)
+        return
+    scalar = str(value)
+    kind, action, ref, problem = classify_uses_target(scalar, job_level)
+    if problem:
+        diag("INVALID_USES_TARGET", f"`{scalar}`: {problem}",
+             severity="warning", line=line, column=col)
+    references.append(WorkflowReference(
+        file=rel, semantic_path=path, kind=kind, raw_target=scalar,
+        action=action, ref=ref, line=line or 0, column=col or 0,
+    ))
+
+
+PARSER_BACKENDS = {"lab": LegacyRegexBackend}
+
+
+def _vendored_parser_integrity_valid(vendor_root=None, artifact_root=None):
+    """Verify the exact bundled parser closure before importing any of it."""
+    vendor_root = Path(vendor_root or (VENDORED_PYTHON_DIR / "ruamel" / "yaml"))
+    artifact_root = Path(artifact_root or VENDORED_PYTHON_DIR.parent)
+    manifest_path = vendor_root / "MANIFEST.action-locker.sha256"
+    try:
+        entries = {}
+        for line in manifest_path.read_text().splitlines():
+            digest, separator, relative = line.partition("  ")
+            if (
+                separator != "  "
+                or not re.fullmatch(r"[0-9a-f]{64}", digest)
+                or relative in entries
+                or not relative.startswith("_vendor/ruamel/yaml/")
+            ):
+                return False
+            path = artifact_root / relative
+            path.resolve().relative_to(vendor_root.resolve())
+            entries[relative] = digest
+
+        actual_paths = set()
+        for path in vendor_root.rglob("*"):
+            if path.is_symlink():
+                return False
+            if (
+                not path.is_file()
+                or "__pycache__" in path.parts
+                or path.suffix == ".pyc"
+                or path == manifest_path
+            ):
+                continue
+            relative = path.relative_to(artifact_root).as_posix()
+            actual_paths.add(relative)
+            if entries.get(relative) != hashlib.sha256(path.read_bytes()).hexdigest():
+                return False
+        return actual_paths == set(entries)
+    except (OSError, UnicodeDecodeError, ValueError):
+        return False
+
+
+def stable_backend_available():
+    """True when the bundled ruamel.yaml is the exact pinned release.
+
+    The pin is part of the security claim, not a suggestion: `stable` is
+    developed and differential-tested against one specific parser closure
+    (STABLE_RUAMEL_PIN), and a different ruamel release can legitimately
+    resolve scalars or duplicate keys differently. Running against an
+    unpinned version would silently change what the authoritative backend
+    accepts. Any missing, mismatched, or ambient copy is reported as
+    `backend unavailable` (scan exit code 4), never a crash and never a
+    silent fall back to another backend or another version.
+    """
+    if not _vendored_parser_integrity_valid():
+        return False
+    try:
+        import ruamel.yaml
+    except ImportError:
+        return False
+    if getattr(ruamel.yaml, "__version__", None) != STABLE_RUAMEL_PIN:
+        return False
+    try:
+        Path(ruamel.yaml.__file__).resolve().relative_to(
+            VENDORED_PYTHON_DIR.resolve()
+        )
+    except (AttributeError, ValueError):
+        return False
+    return True
+
+
+# Disagreement classes, ordered most-actionable first for display.
+COMPARE_CLASSES = (
+    "TARGET_MISMATCH",
+    "KIND_MISMATCH",
+    "MISSING_REFERENCE",
+    "EXTRA_REFERENCE",
+    "DUPLICATE_PATH",
+    "ACCEPTANCE_MISMATCH",
+)
+
+
+def _normalize_refs(result):
+    """{semantic_path: (kind, raw_target)} for a result, plus the set of
+    paths that appeared more than once.
+
+    Comparison identity is (kind, raw_target) keyed by semantic path —
+    NEVER line/column, which backends legitimately report differently. This
+    is the normalization ADR 0001 specifies so a disagreement means a
+    semantic difference, not a formatting one.
+    """
+    seen = {}
+    dups = set()
+    for r in result.references:
+        if r.semantic_path in seen:
+            dups.add(r.semantic_path)
+        else:
+            seen[r.semantic_path] = (r.kind, r.raw_target)
+    return seen, dups
+
+
+def _compare_file(stable_res, lab_res):
+    """Disagreements between the authoritative `stable` result and `lab`.
+
+    Acceptance is the FIRST gate: a backend that rejected a file has no
+    trustworthy reference map, so an acceptance split is the ONLY thing
+    reported for that file — never a spurious per-path diff against a
+    backend that already said "I can't read this." Only when BOTH accept
+    are references diffed, by semantic path, on (kind, raw_target).
+
+    Each disagreement carries `expected`:
+      - True  — the benign, by-design case: stable reads what lab
+                deliberately fails closed on (anchors, folds, flow). This is
+                the migration's normal state, not a bug.
+      - False — worth a human: lab accepting what the authoritative parser
+                rejects, or the two accepting DIFFERENT references for the
+                same slot (one is confidently wrong — the whole reason
+                compare exists).
+
+    Consistency is not correctness: two backends can agree and both be
+    wrong. `compare` measures agreement; the fuzz-vs-oracle corpus measures
+    truth. The `expected` flag keeps the exit code from training anyone to
+    ignore it (cf. the age-floor hold-back rationale in the README).
+    """
+    dis = []
+    if stable_res.accepted != lab_res.accepted:
+        dis.append({
+            "class": "ACCEPTANCE_MISMATCH",
+            "expected": stable_res.accepted and not lab_res.accepted,
+            "stable_accepted": stable_res.accepted,
+            "lab_accepted": lab_res.accepted,
+        })
+        return dis
+    if not stable_res.accepted:
+        return dis  # both rejected: agreement on "cannot scan safely"
+
+    smap, sdups = _normalize_refs(stable_res)
+    lmap, ldups = _normalize_refs(lab_res)
+    for backend, dups in (("stable", sdups), ("lab", ldups)):
+        for p in sorted(dups):
+            dis.append({"class": "DUPLICATE_PATH", "expected": False,
+                        "semantic_path": p, "backend": backend})
+    for p in sorted(set(smap) | set(lmap)):
+        s, l = smap.get(p), lmap.get(p)
+        if s and not l:
+            dis.append({"class": "MISSING_REFERENCE", "expected": False,
+                        "semantic_path": p, "stable": s[1], "lab": None})
+        elif l and not s:
+            dis.append({"class": "EXTRA_REFERENCE", "expected": False,
+                        "semantic_path": p, "stable": None, "lab": l[1]})
+        elif s[1] != l[1]:
+            dis.append({"class": "TARGET_MISMATCH", "expected": False,
+                        "semantic_path": p, "stable": s[1], "lab": l[1]})
+        elif s[0] != l[0]:
+            dis.append({"class": "KIND_MISMATCH", "expected": False,
+                        "semantic_path": p, "stable": s[0], "lab": l[0]})
+    dis.sort(key=lambda d: (COMPARE_CLASSES.index(d["class"]),
+                            d.get("semantic_path", "")))
+    return dis
+
+
+def _reference_as_json(ref):
+    return {
+        "semantic_path": ref.semantic_path,
+        "kind": ref.kind,
+        "raw_target": ref.raw_target,
+        "action": ref.action,
+        "ref": ref.ref,
+        "line": ref.line,
+        "column": ref.column,
+        "end_line": ref.end_line,
+        "end_column": ref.end_column,
+    }
+
+
+def _diagnostic_as_json(diagnostic):
+    return {
+        "code": diagnostic.code,
+        "message": diagnostic.message,
+        "severity": diagnostic.severity,
+        "line": diagnostic.line,
+        "column": diagnostic.column,
+    }
+
+
+def _command_parser_name(args, default="stable"):
+    """Resolve a production command's parser without silent fallback.
+
+    Migration order is explicit CLI, ACTION_LOCKER_PARSER, then the command
+    default. `legacy` remains an internal test/compatibility path and is never
+    accepted from user configuration; the public parser names are the ADR
+    backends. An unknown environment value is configuration failure, not an
+    excuse to run a different scanner.
+    """
+    explicit = getattr(args, "parser_backend", None)
+    configured = explicit or os.environ.get("ACTION_LOCKER_PARSER")
+    if configured is None:
+        return default
+    if configured not in ("lab", "stable", "compare"):
+        print(
+            f"Error: unknown parser backend `{configured}` "
+            "(from --parser or ACTION_LOCKER_PARSER)",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    return configured
+
+
+def _workflow_paths(repo_root):
+    """Return deterministic workflow paths selected outside all backends."""
+    workflows_dir = Path(repo_root) / ".github" / "workflows"
+    if not workflows_dir.exists():
+        print(f"No workflows found at {workflows_dir}", file=sys.stderr)
+        return []
+    return (
+        sorted(workflows_dir.glob("*.yml"))
+        + sorted(workflows_dir.glob("*.yaml"))
+    )
+
+
+def _print_parse_rejection(result):
+    """Print typed parser diagnostics without echoing workflow contents."""
+    for diagnostic in result.diagnostics:
+        if diagnostic.severity != "error":
+            continue
+        position = ""
+        if diagnostic.line is not None:
+            position = f":{diagnostic.line}"
+            if diagnostic.column is not None:
+                position += f":{diagnostic.column}"
+        print(
+            f"Error: {diagnostic.file}{position}: {diagnostic.code}: "
+            f"{diagnostic.message}",
+            file=sys.stderr,
+        )
+
+
+def _parse_for_production(repo_root, parser_name):
+    """Parse every workflow before a production command can act.
+
+    `stable` is authoritative. `compare` requires semantic agreement with
+    lab/0 before returning stable results. Any rejected file or disagreement
+    aborts the whole command before lockfile/workflow mutation, so ambiguity
+    can never become an incomplete successful discovery result.
+    """
+    paths = _workflow_paths(repo_root)
+    if parser_name in ("stable", "compare") and not stable_backend_available():
+        print(
+            f"Error: bundled parser backend `{parser_name}` is missing or "
+            f"does not match ruamel.yaml =={STABLE_RUAMEL_PIN}; reinstall "
+            "the exact Action Locker artifact",
+            file=sys.stderr,
+        )
+        sys.exit(4)
+
+    if parser_name == "lab":
+        backend = LegacyRegexBackend()
+        if not os.environ.get("ACTION_LOCKER_PARSER_LAB_CI"):
+            print(
+                "note: `lab/0` is experimental and may reject YAML outside "
+                "its declared subset",
+                file=sys.stderr,
+            )
+        results = [backend.parse_file(repo_root, path) for path in paths]
+    elif parser_name == "stable":
+        backend = StructuralYamlBackend()
+        results = [backend.parse_file(repo_root, path) for path in paths]
+    else:
+        stable = StructuralYamlBackend()
+        lab = LegacyRegexBackend()
+        results = []
+        disagreed = False
+        for path in paths:
+            stable_result = stable.parse_file(repo_root, path)
+            lab_result = lab.parse_file(repo_root, path)
+            disagreements = _compare_file(stable_result, lab_result)
+            if disagreements:
+                disagreed = True
+                rel = path.relative_to(repo_root).as_posix()
+                print(f"Error: PARSER DISAGREEMENT {rel}", file=sys.stderr)
+                for disagreement in disagreements:
+                    for line in _format_disagreement_lines(disagreement):
+                        print(line, file=sys.stderr)
+            results.append(stable_result)
+        if disagreed:
+            sys.exit(3)
+
+    rejected = [result for result in results if not result.accepted]
+    if rejected:
+        for result in rejected:
+            _print_parse_rejection(result)
+        sys.exit(1)
+    return results
+
+
+def discover_workflow_actions(repo_root, args, default="stable"):
+    """Return the compatibility action/location map from a chosen backend.
+
+    Local actions and docker images are structurally classified but are not
+    lockfile subjects. An external/reusable target that cannot be split into
+    action/ref is a policy error: production commands must not silently omit
+    an executable `uses` slot that the parser found.
+    """
+    parser_name = _command_parser_name(args, default=default)
+    if parser_name == "legacy":
+        return parse_workflows(repo_root)
+
+    results = _parse_for_production(repo_root, parser_name)
+    actions = {}
+    invalid = []
+    for result in results:
+        for reference in result.references:
+            if reference.kind == "docker-image":
+                print(
+                    f"Note: skipping docker:// ref "
+                    f"({reference.file}:{reference.line}) — not managed by "
+                    "action-locker; pin images by digest",
+                    file=sys.stderr,
+                )
+                continue
+            if reference.kind == "local-action":
+                continue
+            if reference.action is None or reference.ref is None:
+                invalid.append(reference)
+                continue
+            key = f"{reference.action}@{reference.ref}"
+            actions.setdefault(key, []).append((reference.file, reference.line))
+
+    if invalid:
+        for reference in invalid:
+            print(
+                f"Error: {reference.file}:{reference.line}:{reference.column}: "
+                f"INVALID_USES_TARGET: `{reference.raw_target}`",
+                file=sys.stderr,
+            )
+        sys.exit(1)
+    return actions
+
+
 # --- Commands ---
 
 def cmd_lock(args, repo_root):
     """Resolve all action refs to SHAs and write lockfile."""
-    actions = parse_workflows(repo_root)
+    actions = discover_workflow_actions(repo_root, args)
     if not actions:
         print("No actions found in workflows.")
         return
@@ -885,7 +2455,7 @@ def cmd_lock(args, repo_root):
 
 def cmd_verify(args, repo_root):
     """Verify all workflow refs match the lockfile."""
-    actions = parse_workflows(repo_root)
+    actions = discover_workflow_actions(repo_root, args)
     lockdata = load_lockfile(repo_root)
 
     if not lockdata["locked"]:
@@ -1282,39 +2852,302 @@ def cmd_update(args, repo_root):
             print("\nRun `action-locker update --apply` to apply these updates.")
 
 
-def cmd_rewrite(args, repo_root):
-    """Rewrite workflow files to use pinned SHAs from the lockfile."""
-    lockdata = load_lockfile(repo_root)
-    if not lockdata["locked"]:
-        print("No lockfile found. Run `action-locker lock` first.", file=sys.stderr)
-        sys.exit(1)
+class StructuralRewriteError(Exception):
+    """A fail-closed structural rewrite refusal."""
 
-    # Build a lookup: action@mutable_ref -> sha. The pinned comment shows
-    # `selected` when the entry was held back — the comment tells the truth
-    # about what you actually got (and it's what Dependabot reads).
+
+def _rewrite_ref_map(lockdata):
+    """Mutable action/ref -> (resolved SHA, truthful display tag)."""
     ref_map = {}
     for action_ref, entry in lockdata["locked"].items():
         action, ref = action_ref.rsplit("@", 1)
         if not is_sha(ref):
-            ref_map[(action, ref)] = (entry["resolved"], entry.get("selected") or ref)
+            ref_map[(action, ref)] = (
+                entry["resolved"], entry.get("selected") or ref
+            )
+    return ref_map
 
+
+def _line_start_offsets(text):
+    """Character offsets for each one-based parser line."""
+    offsets = [0]
+    offsets.extend(match.end() for match in re.finditer("\n", text))
+    return offsets
+
+
+def _source_scalar_span(text, reference):
+    """Locate a scalar only from its structural parser line/column.
+
+    Supports plain/quoted scalars, flow delimiters, inline anchors, and
+    aliases. It never searches unrelated lines for matching target text.
+    """
+    if reference.line < 1 or reference.column < 1:
+        raise StructuralRewriteError(
+            f"{reference.file}:{reference.semantic_path} has no source position"
+        )
+    offsets = _line_start_offsets(text)
+    if reference.line > len(offsets):
+        raise StructuralRewriteError("parser source line is out of range")
+    start = offsets[reference.line - 1] + reference.column - 1
+    if start >= len(text):
+        raise StructuralRewriteError("parser source column is out of range")
+
+    cursor = start
+    if text[cursor] == "&":
+        cursor += 1
+        while cursor < len(text) and text[cursor] not in " \t\r\n,[]{}#":
+            cursor += 1
+        if cursor == start + 1:
+            raise StructuralRewriteError("empty YAML anchor at uses value")
+        while cursor < len(text) and text[cursor] in " \t":
+            cursor += 1
+        if cursor >= len(text):
+            raise StructuralRewriteError("anchor has no scalar value")
+
+    value_start = cursor
+    if text[cursor] == "*":
+        cursor += 1
+        while cursor < len(text) and text[cursor] not in " \t\r\n,[]{}#":
+            cursor += 1
+        return start, cursor, "alias", value_start
+
+    if text[cursor] == "'":
+        cursor += 1
+        while cursor < len(text):
+            if text[cursor] == "'":
+                if cursor + 1 < len(text) and text[cursor + 1] == "'":
+                    cursor += 2
+                    continue
+                return start, cursor + 1, "single", value_start
+            cursor += 1
+        raise StructuralRewriteError("unterminated single-quoted uses scalar")
+
+    if text[cursor] == '"':
+        cursor += 1
+        while cursor < len(text):
+            if text[cursor] == "\\":
+                cursor += 2
+                continue
+            if cursor < len(text) and text[cursor] == '"':
+                return start, cursor + 1, "double", value_start
+            cursor += 1
+        raise StructuralRewriteError("unterminated double-quoted uses scalar")
+
+    while cursor < len(text):
+        char = text[cursor]
+        if char in "\r\n,}]":
+            break
+        if char == "#" and cursor > value_start and text[cursor - 1] in " \t":
+            break
+        cursor += 1
+    end = cursor
+    while end > value_start and text[end - 1] in " \t":
+        end -= 1
+    if end == value_start:
+        raise StructuralRewriteError("empty uses scalar")
+    return start, end, "plain", value_start
+
+
+def _validate_source_scalar(text, span, reference):
+    """Cross-check a located token against the parser's semantic value."""
+    _, end, style, value_start = span
+    if style == "alias":
+        return
+    token = text[value_start:end]
+    try:
+        parsed = StructuralYamlBackend()._loader().load("value: " + token + "\n")
+        decoded = parsed["value"]
+    except Exception as exc:
+        raise StructuralRewriteError(
+            f"cannot validate source scalar: {exc.__class__.__name__}"
+        ) from exc
+    if not isinstance(decoded, str) or str(decoded) != reference.raw_target:
+        raise StructuralRewriteError(
+            f"source span for {reference.semantic_path} does not match "
+            "the structural parse"
+        )
+
+
+def _scalar_replacement(text, span, target, tag):
+    """Build a style-preserving replacement and safe optional tag comment."""
+    start, end, style, value_start = span
+    prefix = text[start:value_start] if style != "alias" else ""
+    if style == "single":
+        scalar = "'" + target.replace("'", "''") + "'"
+    elif style == "double":
+        escaped = target.replace("\\", "\\\\").replace('"', '\\"')
+        scalar = '"' + escaped + '"'
+    else:
+        scalar = target
+    replacement = prefix + scalar
+
+    line_end = text.find("\n", end)
+    if line_end == -1:
+        line_end = len(text)
+    content_end = (
+        line_end - 1
+        if line_end > end and text[line_end - 1] == "\r"
+        else line_end
+    )
+    # Existing comments remain byte-identical. A flow delimiter means an EOL
+    # comment would swallow executable YAML, so the lockfile carries the tag.
+    if not text[end:content_end].strip():
+        replacement += f"  # {tag}"
+    return start, end, replacement
+
+
+def _candidate_rewrite_bytes(original, result, ref_map):
+    """Prepare one workflow rewrite entirely in memory."""
+    bom = original.startswith(b"\xef\xbb\xbf")
+    try:
+        text = original.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise StructuralRewriteError("workflow is not UTF-8") from exc
+
+    edits = {}
+    expected = {}
+    for reference in result.references:
+        if reference.action is None or reference.ref is None:
+            continue
+        replacement = ref_map.get((reference.action, reference.ref))
+        if replacement is None:
+            continue
+        sha, tag = replacement
+        target = f"{reference.action}@{sha}"
+        span = _source_scalar_span(text, reference)
+        _validate_source_scalar(text, span, reference)
+        start, end, content = _scalar_replacement(text, span, target, tag)
+        key = (start, end)
+        if key in edits and edits[key] != content:
+            raise StructuralRewriteError("conflicting rewrites share a source span")
+        edits[key] = content
+        expected[reference.semantic_path] = target
+
+    for (start, end), replacement in sorted(edits.items(), reverse=True):
+        text = text[:start] + replacement + text[end:]
+    candidate = text.encode("utf-8")
+    if bom:
+        candidate = b"\xef\xbb\xbf" + candidate
+    return candidate, expected
+
+
+def _validate_rewrite_candidate(repo_root, path, original_result, candidate,
+                                expected, compare=False):
+    """Reparse candidate bytes and enforce semantic postconditions."""
+    with tempfile.TemporaryDirectory(dir=path.parent) as tmpdir:
+        candidate_path = Path(tmpdir) / path.name
+        candidate_path.write_bytes(candidate)
+        stable_result = StructuralYamlBackend().parse_file(repo_root, candidate_path)
+        if not stable_result.accepted:
+            codes = ", ".join(d.code for d in stable_result.diagnostics)
+            raise StructuralRewriteError(
+                f"candidate for {path.name} failed stable reparse ({codes})"
+            )
+        before = {r.semantic_path: r for r in original_result.references}
+        after = {r.semantic_path: r for r in stable_result.references}
+        if set(before) != set(after):
+            raise StructuralRewriteError(
+                f"candidate for {path.name} changed executable uses paths"
+            )
+        for semantic_path, old in before.items():
+            new = after[semantic_path]
+            wanted = expected.get(semantic_path, old.raw_target)
+            if new.raw_target != wanted or new.kind != old.kind:
+                raise StructuralRewriteError(
+                    f"candidate postcondition failed at {semantic_path}"
+                )
+        if compare:
+            lab_result = LegacyRegexBackend().parse_file(repo_root, candidate_path)
+            if _compare_file(stable_result, lab_result):
+                raise StructuralRewriteError(
+                    f"candidate for {path.name} disagrees with lab/0"
+                )
+
+
+def _atomic_write_bytes(path, content):
+    """Replace one file atomically from a same-directory temporary file."""
+    path = Path(path)
+    mode = path.stat().st_mode
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", dir=path.parent, prefix=f".{path.name}.",
+            suffix=".action-locker.tmp", delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+        temporary = None
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _cmd_rewrite_structural(repo_root, lockdata, parser_name):
+    """Source-aware, postcondition-checked structural rewrite."""
+    ref_map = _rewrite_ref_map(lockdata)
     if not ref_map:
         print("No mutable refs to rewrite (everything is already pinned).")
         return
+    paths = _workflow_paths(repo_root)
+    results = _parse_for_production(repo_root, parser_name)
+    prepared = []
+    rewrites = 0
+    try:
+        for path, result in zip(paths, results):
+            original = path.read_bytes()
+            candidate, expected = _candidate_rewrite_bytes(original, result, ref_map)
+            if candidate == original:
+                continue
+            _validate_rewrite_candidate(
+                repo_root, path, result, candidate, expected,
+                compare=parser_name == "compare",
+            )
+            prepared.append((path, original, candidate))
+            rewrites += len(expected)
+    except (OSError, StructuralRewriteError) as exc:
+        print(f"Error: structural rewrite aborted: {exc}", file=sys.stderr)
+        sys.exit(1)
 
+    committed = []
+    try:
+        for path, original, candidate in prepared:
+            _atomic_write_bytes(path, candidate)
+            committed.append((path, original))
+            print(f"  Rewrote {path.relative_to(repo_root)}")
+    except OSError as exc:
+        for path, original in reversed(committed):
+            try:
+                _atomic_write_bytes(path, original)
+            except OSError:
+                pass
+        print(f"Error: atomic rewrite failed: {exc}", file=sys.stderr)
+        sys.exit(1)
+    print(f"\n{rewrites} reference(s) rewritten to pinned SHAs.")
+
+
+def _cmd_rewrite_legacy(repo_root, lockdata):
+    """Private compatibility implementation; never user-selectable."""
+    ref_map = _rewrite_ref_map(lockdata)
+    if not ref_map:
+        print("No mutable refs to rewrite (everything is already pinned).")
+        return
     workflows_dir = repo_root / ".github" / "workflows"
     rewrites = 0
-
     for wf_file in sorted(workflows_dir.glob("*.yml")) + sorted(workflows_dir.glob("*.yaml")):
         lines = wf_file.read_text().splitlines(keepends=True)
         modified = False
-
         for i, line in enumerate(lines):
             match = USES_PATTERN.search(line)
             if match:
                 action = match.group("action")
                 ref = match.group("ref")
-
                 if (action, ref) in ref_map:
                     sha, tag = ref_map[(action, ref)]
                     old = f"{action}@{ref}"
@@ -1322,12 +3155,293 @@ def cmd_rewrite(args, repo_root):
                     lines[i] = line.replace(old, new)
                     modified = True
                     rewrites += 1
-
         if modified:
             wf_file.write_text("".join(lines))
             print(f"  Rewrote {wf_file.relative_to(repo_root)}")
-
     print(f"\n{rewrites} reference(s) rewritten to pinned SHAs.")
+
+
+def cmd_rewrite(args, repo_root):
+    """Rewrite workflows through the selected parser mutation boundary."""
+    lockdata = load_lockfile(repo_root)
+    if not lockdata["locked"]:
+        print("No lockfile found. Run `action-locker lock` first.", file=sys.stderr)
+        sys.exit(1)
+    parser_name = _command_parser_name(args, default="stable")
+    if parser_name == "lab":
+        print("Error: parser backend `lab` is scan-only", file=sys.stderr)
+        sys.exit(2)
+    if parser_name == "legacy":
+        return _cmd_rewrite_legacy(repo_root, lockdata)
+    return _cmd_rewrite_structural(repo_root, lockdata, parser_name)
+
+
+def cmd_scan(args, repo_root):
+    """Structurally scan workflows with a selected parser backend.
+
+    Read-only and fully offline: parses workflow bytes, prints results,
+    touches nothing. The same stable backend is authoritative for production
+    commands; lab and compare remain explicit diagnostic modes.
+
+    Exit codes (docs/parser-lab/IMPLEMENTATION.md): 0 = parsed cleanly;
+    1 = a file was rejected (parser uncertainty is an error, never an
+    empty result); 2 = invalid configuration; 4 = requested backend
+    unavailable.
+    """
+    requested = (
+        args.parser_backend
+        or os.environ.get("ACTION_LOCKER_PARSER")
+        or "stable"
+    )
+    if requested not in ("lab", "stable", "compare"):
+        print(
+            f"Error: unknown parser backend `{requested}` "
+            f"(from --parser or ACTION_LOCKER_PARSER)",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    if requested == "compare":
+        _cmd_scan_compare(args, repo_root)  # exits with its own code
+        return
+
+    # Resolve the requested backend. `backend unavailable` (exit 4) is
+    # distinct from `rejected` (exit 1): a missing bundled dependency must
+    # never make the scanner silently answer with a different engine.
+    if requested == "lab":
+        backend = LegacyRegexBackend()
+    else:  # stable
+        if not stable_backend_available():
+            print(
+                "Error: bundled parser backend `stable` is missing or does "
+                f"not match ruamel.yaml =={STABLE_RUAMEL_PIN}; reinstall the "
+                "exact Action Locker artifact",
+                file=sys.stderr,
+            )
+            sys.exit(4)
+        backend = StructuralYamlBackend()
+
+    if requested == "lab" and not os.environ.get("ACTION_LOCKER_PARSER_LAB_CI"):
+        print(
+            yellow(
+                f"note: `{backend.name}` is an experimental parser backend; "
+                "set ACTION_LOCKER_PARSER_LAB_CI=1 to silence."
+            ),
+            file=sys.stderr,
+        )
+
+    workflows_dir = repo_root / ".github" / "workflows"
+    wf_files = []
+    if workflows_dir.is_dir():
+        wf_files = sorted(workflows_dir.glob("*.yml")) + sorted(
+            workflows_dir.glob("*.yaml")
+        )
+    results = sorted(
+        (
+            (f.relative_to(repo_root).as_posix(), backend.parse_file(repo_root, f))
+            for f in wf_files
+        ),
+        key=lambda item: item[0],
+    )
+    all_accepted = all(r.accepted for _, r in results)
+
+    if args.format == "json":
+        payload = {
+            "schema_version": PARSER_LAB_SCHEMA_VERSION,
+            "backend": backend.name,
+            "accepted": all_accepted,
+            "files": [
+                {
+                    "path": rel,
+                    "accepted": r.accepted,
+                    "references": [_reference_as_json(x) for x in r.references],
+                    "diagnostics": [_diagnostic_as_json(d) for d in r.diagnostics],
+                }
+                for rel, r in results
+            ],
+        }
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        total_refs = 0
+        for rel, r in results:
+            if r.accepted:
+                print(f"{rel} ({len(r.references)} reference(s))")
+            else:
+                print(red(f"REJECTED {rel}"))
+            for x in r.references:
+                total_refs += 1
+                print(f"  {x.semantic_path}  {x.kind}  {x.raw_target}")
+            for d in r.diagnostics:
+                paint = red if d.severity == "error" else yellow
+                where = f" line {d.line}" if d.line else ""
+                print(paint(f"  {d.severity}[{d.code}]{where}: {d.message}"))
+        if not results:
+            print(f"No workflow files found under {workflows_dir}")
+        summary = (
+            f"\n{len(results)} file(s), {total_refs} reference(s), "
+            f"backend {backend.name}"
+        )
+        if all_accepted:
+            print(green(summary))
+        else:
+            print(red(summary + " — rejected file(s) present"))
+
+    sys.exit(0 if all_accepted else 1)
+
+
+def _cmd_scan_compare(args, repo_root):
+    """Differential `scan --parser compare`: run lab/0 and stable over the
+    same bytes and diff their normalized results.
+
+    `stable` is authoritative; this measures where the experimental lab
+    agrees with it (ADR 0001). Read-only and offline. Requires the bundled
+    stable parser — missing it is `backend unavailable` (exit 4), never a
+    single-backend fallback.
+
+    Exit codes: 3 = the backends disagreed on some file; 1 = they agreed
+    but the authoritative parser rejected a workflow; 0 = agree and stable
+    accepted everything; 4 = stable unavailable. Exit 3 fires on ANY
+    disagreement (the honest signal); the report separates `expected`
+    subset-gaps from `actionable` ones so a future CI gate can choose its
+    own policy explicitly rather than inheriting a silent one.
+    """
+    if not stable_backend_available():
+        print(
+            "Error: bundled parser backend `compare` is missing or does not "
+            f"match ruamel.yaml =={STABLE_RUAMEL_PIN}; reinstall the exact "
+            "Action Locker artifact",
+            file=sys.stderr,
+        )
+        sys.exit(4)
+
+    lab = LegacyRegexBackend()
+    stable = StructuralYamlBackend()
+    if not os.environ.get("ACTION_LOCKER_PARSER_LAB_CI"):
+        print(
+            yellow(
+                "note: `compare` runs the experimental "
+                f"`{lab.name}` backend against authoritative `{stable.name}`; "
+                "explicit compare requires semantic agreement. "
+                "Set ACTION_LOCKER_PARSER_LAB_CI=1 to silence."
+            ),
+            file=sys.stderr,
+        )
+
+    workflows_dir = repo_root / ".github" / "workflows"
+    wf_files = []
+    if workflows_dir.is_dir():
+        wf_files = sorted(workflows_dir.glob("*.yml")) + sorted(
+            workflows_dir.glob("*.yaml")
+        )
+
+    files = []
+    for f in sorted(wf_files, key=lambda p: p.relative_to(repo_root).as_posix()):
+        rel = f.relative_to(repo_root).as_posix()
+        s_res = stable.parse_file(repo_root, f)
+        l_res = lab.parse_file(repo_root, f)
+        dis = _compare_file(s_res, l_res)
+        files.append((rel, s_res, l_res, dis))
+
+    any_disagreement = any(dis for _, _, _, dis in files)
+    any_actionable = any(
+        not d["expected"] for _, _, _, dis in files for d in dis
+    )
+    stable_all_accepted = all(s.accepted for _, s, _, _ in files)
+
+    if args.format == "json":
+        payload = {
+            "schema_version": PARSER_LAB_SCHEMA_VERSION,
+            "authoritative_backend": stable.name,
+            "backends": {"stable": stable.name, "lab": lab.name},
+            "agreement": not any_disagreement,
+            "actionable": any_actionable,
+            "files": [
+                {
+                    "path": rel,
+                    "agreement": not dis,
+                    "disagreements": dis,
+                    "stable": {
+                        "accepted": s.accepted,
+                        "references": [_reference_as_json(x) for x in s.references],
+                        "diagnostics": [_diagnostic_as_json(d) for d in s.diagnostics],
+                    },
+                    "lab": {
+                        "accepted": l.accepted,
+                        "references": [_reference_as_json(x) for x in l.references],
+                        "diagnostics": [_diagnostic_as_json(d) for d in l.diagnostics],
+                    },
+                }
+                for rel, s, l, dis in files
+            ],
+        }
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        agree_count = 0
+        for rel, s, l, dis in files:
+            if not dis:
+                agree_count += 1
+                if s.accepted:
+                    print(green(f"{rel}: agree ({len(s.references)} reference(s))"))
+                else:
+                    print(f"{rel}: agree (both rejected)")
+                continue
+            print(red(f"PARSER DISAGREEMENT {rel}"))
+            for d in dis:
+                for line in _format_disagreement_lines(d):
+                    print(line)
+        if not files:
+            print(f"No workflow files found under {workflows_dir}")
+        expected_n = sum(
+            1 for _, _, _, dis in files for d in dis if d["expected"]
+        )
+        actionable_n = sum(
+            1 for _, _, _, dis in files for d in dis if not d["expected"]
+        )
+        disagree_files = sum(1 for _, _, _, dis in files if dis)
+        summary = (
+            f"\n{len(files)} file(s): {agree_count} agree, "
+            f"{disagree_files} disagree "
+            f"({actionable_n} actionable, {expected_n} expected); "
+            f"authoritative: {stable.name}"
+        )
+        if any_actionable:
+            print(red(summary))
+        elif any_disagreement:
+            print(yellow(summary + " — all expected (lab fails closed on its subset)"))
+        else:
+            print(green(summary))
+
+    if any_disagreement:
+        sys.exit(3)
+    sys.exit(0 if stable_all_accepted else 1)
+
+
+def _format_disagreement_lines(d):
+    """Human-readable lines for one disagreement (ADR 0001 observability
+    shape). Workflow content is never printed — only paths, kinds, codes,
+    and `uses` targets — because scripts may embed secrets."""
+    cls = d["class"]
+    mark = " (expected)" if d["expected"] else ""
+    absent = "<absent>"
+    if cls == "ACCEPTANCE_MISMATCH":
+        s = "accepted" if d["stable_accepted"] else "rejected"
+        l = "accepted" if d["lab_accepted"] else "rejected"
+        return [f"  {cls}{mark}  stable={s}  lab={l}"]
+    if cls in ("MISSING_REFERENCE", "EXTRA_REFERENCE", "TARGET_MISMATCH"):
+        return [
+            f"  {cls}{mark} {d['semantic_path']}",
+            f"    stable: {d['stable'] if d['stable'] is not None else absent}",
+            f"    lab:    {d['lab'] if d['lab'] is not None else absent}",
+        ]
+    if cls == "KIND_MISMATCH":
+        return [
+            f"  {cls}{mark} {d['semantic_path']}",
+            f"    stable: {d['stable']}",
+            f"    lab:    {d['lab']}",
+        ]
+    if cls == "DUPLICATE_PATH":
+        return [f"  {cls}{mark} {d['semantic_path']} ({d['backend']})"]
+    return [f"  {cls}{mark}"]
 
 
 # --- CLI ---
@@ -1356,9 +3470,21 @@ def main():
         "--no-fallback", action="store_true",
         help="Never hold back to an older release; refuse fresh targets outright",
     )
+    lock_parser.add_argument(
+        "--parser", dest="parser_backend",
+        choices=["lab", "stable", "compare"], default=None,
+        help="workflow parser (default: ACTION_LOCKER_PARSER, else stable)",
+    )
 
     # verify
-    subparsers.add_parser("verify", help="Check that all workflow refs match the lockfile")
+    verify_parser = subparsers.add_parser(
+        "verify", help="Check that all workflow refs match the lockfile"
+    )
+    verify_parser.add_argument(
+        "--parser", dest="parser_backend",
+        choices=["lab", "stable", "compare"], default=None,
+        help="workflow parser (default: ACTION_LOCKER_PARSER, else stable)",
+    )
 
     # vendor
     vendor_parser = subparsers.add_parser("vendor", help="Download locked actions into vendor directory")
@@ -1382,7 +3508,29 @@ def main():
     )
 
     # rewrite
-    subparsers.add_parser("rewrite", help="Rewrite workflow files to use pinned SHAs from lockfile")
+    rewrite_parser = subparsers.add_parser(
+        "rewrite", help="Rewrite workflow files to use pinned SHAs from lockfile"
+    )
+    rewrite_parser.add_argument(
+        "--parser", dest="parser_backend",
+        choices=["lab", "stable", "compare"], default=None,
+        help="rewrite parser (stable or compare; default: ACTION_LOCKER_PARSER, else stable)",
+    )
+
+    # scan (workflow parser diagnostics — ADR 0001)
+    scan_parser = subparsers.add_parser(
+        "scan",
+        help="structurally scan workflows for `uses` references",
+    )
+    scan_parser.add_argument(
+        "--parser", dest="parser_backend",
+        choices=["lab", "stable", "compare"], default=None,
+        help="parser backend (default: ACTION_LOCKER_PARSER env var, else `stable`)",
+    )
+    scan_parser.add_argument(
+        "--format", choices=["text", "json"], default="text",
+        help="output format (json is deterministic and schema-versioned)",
+    )
 
     args = parser.parse_args()
     repo_root = find_repo_root()
@@ -1393,6 +3541,7 @@ def main():
         "vendor": cmd_vendor,
         "update": cmd_update,
         "rewrite": cmd_rewrite,
+        "scan": cmd_scan,
     }
 
     commands[args.command](args, repo_root)

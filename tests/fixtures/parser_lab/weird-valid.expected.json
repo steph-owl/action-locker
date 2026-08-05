@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "accepted": true,
+  "references": [
+    {
+      "semantic_path": "jobs.reusable.uses",
+      "kind": "reusable-workflow",
+      "raw_target": "octo-org/example/.github/workflows/test.yml@v2",
+      "action": "octo-org/example/.github/workflows/test.yml",
+      "ref": "v2"
+    },
+    {
+      "semantic_path": "jobs.build.steps[1].uses",
+      "kind": "external-action",
+      "raw_target": "actions/checkout@v4",
+      "action": "actions/checkout",
+      "ref": "v4"
+    },
+    {
+      "semantic_path": "jobs.build.steps[2].uses",
+      "kind": "external-action",
+      "raw_target": "actions/setup-python@v5",
+      "action": "actions/setup-python",
+      "ref": "v5"
+    },
+    {
+      "semantic_path": "jobs.build.steps[3].uses",
+      "kind": "local-action",
+      "raw_target": "./tools/local-action",
+      "action": null,
+      "ref": null
+    },
+    {
+      "semantic_path": "jobs.build.steps[4].uses",
+      "kind": "docker-image",
+      "raw_target": "docker://alpine:3.20",
+      "action": null,
+      "ref": null
+    }
+  ],
+  "diagnostics": []
+}
